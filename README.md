@@ -51,8 +51,10 @@ wyniki/
   zestawienie_stacji.xlsx         zestawienie stacji
 ```
 
-Kafle i odpowiedzi Nominatim są zapisywane w `.cache/`, więc kolejne
-uruchomienia działają szybko i nie obciążają serwerów OSM.
+Kafle i odpowiedzi serwisów są zapisywane w cache – domyślnie poza folderem projektu
+(Windows: `%LOCALAPPDATA%\Orientacje-arkusze\cache`), żeby OneDrive nie synchronizował
+ani nie blokował tysięcy kafli. Inny katalog: `--cache`. Gdy zapis cache się nie uda,
+program pobiera podkład dalej, tylko bez zapisywania kafli.
 
 ### Najważniejsze opcje
 
@@ -103,13 +105,13 @@ widać w kolumnie **Źródło podkładu**. Gdy nie działa żadne, w arkuszu zos
 
 ### Gdy podkład się nie pobiera
 
-1. Sprawdź wersję – na początku program wypisuje `Generator arkuszy v1.2.1`
+1. Sprawdź wersję – na początku program wypisuje `Generator arkuszy v1.2.2`
    i listę źródeł podkładu. Jeśli tego nie widać, uruchamiasz starą wersję pliku.
 2. Uruchom diagnostykę: `python generuj_arkusze.py --test-zrodel`. Program pobierze po jednym
    kaflu z każdego źródła i wypisze `[OK]` / `[BŁĄD]` z przyczyną (także dla źródeł nazw i Pillow).
 3. W sieci firmowej z inspekcją SSL spróbuj `--bez-weryfikacji-ssl`.
 4. Na końcu program wypisuje blok `PODKŁAD MAPOWY: N/M arkuszy z nowym podkładem` – ile
-   fragmentów pobrano z internetu, ile wzięto z cache (`.cache/kafle`), które źródła wyłączono
+   fragmentów pobrano z internetu, ile wzięto z cache, które źródła wyłączono
    i dlaczego każdy arkusz bez podkładu go nie dostał. `--odswiez-podklad` ignoruje cache.
 
 Źródło jest wyłączane do końca przebiegu tylko przy odmowie serwera (HTTP 403/404…),

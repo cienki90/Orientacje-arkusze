@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 from xml.sax.saxutils import escape
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 
 # ============================================================================
@@ -616,8 +616,14 @@ class PlaceResolver:
 
     # --- infrastruktura -------------------------------------------------------------
     def _save(self):
-        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        self.cache_path.write_text(json.dumps(self.cache, ensure_ascii=False, indent=1), encoding="utf-8")
+        if getattr(self, "_save_broken", False):
+            return
+        try:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self.cache_path.write_text(json.dumps(self.cache, ensure_ascii=False, indent=1), encoding="utf-8")
+        except OSError as exc:              # np. OneDrive blokuje plik - działamy bez zapisu cache
+            self._save_broken = True
+            self.log(f"UWAGA: nie mogę zapisać cache nazw {self.cache_path} ({exc}) - pracuję bez niego")
 
     def _get(self, key: str, url: str, data: bytes | None = None) -> bytes:
         wait = _MIN_INTERVAL.get(key, 0) - (time.time() - self._last.get(key, 0))
@@ -853,20 +859,33 @@ class BasemapProvider:
         self.downloaded: dict[str, int] = {}
         self.from_cache: dict[str, int] = {}
         self.refresh = False                    # True = ignoruj cache, pobierz od nowa
+        self.cache_broken = False               # zapis cache się nie udał - tylko pamięć
         self.error_log: Path | None = None
 
     # --- pobieranie z cache ------------------------------------------------------
     def _cached(self, src: BasemapSource, rel: str, url: str) -> bytes:
         path = self.cache_dir / "kafle" / src.key / rel
-        if not self.refresh and path.exists() and path.stat().st_size > 0:
-            self.from_cache[src.key] = self.from_cache.get(src.key, 0) + 1
-            return path.read_bytes()
+        try:
+            if not self.refresh and path.exists() and path.stat().st_size > 0:
+                data = path.read_bytes()
+                if data.startswith(_IMAGE_MAGIC):
+                    self.from_cache[src.key] = self.from_cache.get(src.key, 0) + 1
+                    return data
+        except OSError:
+            pass                                 # uszkodzony/zablokowany plik cache - pobierz od nowa
         data = _check_image(_http_get(url, self.user_agent, timeout=20, retries=2), url)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_bytes(data)
-        os.replace(tmp, path)
         self.downloaded[src.key] = self.downloaded.get(src.key, 0) + 1
+        if not self.cache_broken:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_suffix(f".{os.getpid()}.tmp")
+                tmp.write_bytes(data)
+                os.replace(tmp, path)
+            except OSError as exc:
+                # np. OneDrive/antywirus blokuje plik - pracujemy dalej bez cache
+                self.cache_broken = True
+                self.log(f"UWAGA: nie mogę zapisywać cache kafli w {self.cache_dir} ({exc}). "
+                         "Podkład pobieram dalej, ale bez zapisywania kafli (opcja --cache zmienia katalog).")
         time.sleep(self.delay)
         return data
 
@@ -911,7 +930,10 @@ class BasemapProvider:
             # serwer odsyła wszędzie ten sam kafel: "Access blocked" albo pusty obraz
             for tx in range(tx0, tx1 + 1):
                 for ty in range(ty0, ty1 + 1):
-                    (self.cache_dir / "kafle" / src.key / f"{zoom}/{tx}/{ty}.img").unlink(missing_ok=True)
+                    try:
+                        (self.cache_dir / "kafle" / src.key / f"{zoom}/{tx}/{ty}.img").unlink(missing_ok=True)
+                    except OSError:
+                        pass
             raise OsmError(f"wszystkie {n_tiles} kafli są identyczne - serwer blokuje dostęp "
                            "albo zwraca puste kafle", hard=True)
         ox, oy = tx0 * ts, ty0 * ts
@@ -1008,7 +1030,8 @@ class BasemapProvider:
             else:
                 img, _ = self._render_xyz(src, bbox, zone, width, height, resolution, zoom)
         except Exception as exc:  # noqa: BLE001 - każde niepowodzenie = następne źródło
-            errors.append(f"{src.key}: {exc}")
+            errors.append(f"{src.key}: {type(exc).__name__}: {exc}")
+            self._write_error_log(src)
             self._source_failed(src, exc)
             if src.key not in self.dead:
                 retry.append(src)
@@ -1019,23 +1042,35 @@ class BasemapProvider:
     def _save(self, img, out_png, bbox, width, height, resolution, src):
         out_png = Path(out_png)
         out_png.parent.mkdir(parents=True, exist_ok=True)
-        img.save(out_png, optimize=True)
+        try:
+            img.save(out_png, optimize=True)
+        except OSError as exc:
+            raise OSError(f"nie mogę zapisać {out_png}: {exc} (plik otwarty w innym programie "
+                          "lub zablokowany przez OneDrive?)") from exc
         out_png.with_suffix(".pgw").write_text(            # środek lewego górnego piksela
             "\n".join(f"{v:.10f}" for v in (resolution, 0.0, 0.0, -resolution,
                                              bbox[0] + resolution / 2, bbox[3] - resolution / 2)) + "\n")
         return {"path": out_png, "width": width, "height": height, "xmin": bbox[0], "ymin": bbox[1],
                 "resolution": resolution, "source": src}
 
-    def _source_failed(self, src, exc):
+    def _write_error_log(self, src):
         import traceback
-        from_source = isinstance(exc, (OsmError, OSError)) or type(exc).__name__ == "UnidentifiedImageError"
+        if self.error_log is None:
+            return
+        try:
+            self.error_log.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.error_log, "a", encoding="utf-8") as f:
+                f.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} {src.key} ---\n{traceback.format_exc()}\n")
+        except OSError:
+            pass
+
+    def _source_failed(self, src, exc):
+        # tylko błędy po stronie serwera (OsmError) i nieczytelne obrazy wyłączają źródło;
+        # błędy lokalne (zapis plików, przetwarzanie) - nie
+        from_source = isinstance(exc, OsmError) or type(exc).__name__ == "UnidentifiedImageError"
         if not from_source:
-            # to nie wina serwera, tylko przetwarzania obrazu - zapisz szczegóły
-            if self.error_log is not None:
-                self.error_log.parent.mkdir(parents=True, exist_ok=True)
-                with open(self.error_log, "a", encoding="utf-8") as f:
-                    f.write(f"--- {src.key} ---\n{traceback.format_exc()}\n")
-            self.log(f"UWAGA: błąd przetwarzania podkładu z '{src.name}': {type(exc).__name__}: {exc}"
+            self.log(f"UWAGA: błąd lokalny przy podkładzie z '{src.name}' (to nie wina serwera): "
+                     f"{type(exc).__name__}: {exc}"
                      + (f" (szczegóły: {self.error_log})" if self.error_log else ""))
             return
         hard = getattr(exc, "hard", False)
@@ -1657,13 +1692,22 @@ class Generator:
 # ============================================================================
 # WIERSZ POLECEŃ
 # ============================================================================
+def default_cache_dir(here: Path) -> Path:
+    """Cache poza folderem projektu (OneDrive nie musi synchronizować tysięcy kafli)."""
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_CACHE_HOME")
+    if base:
+        return Path(base) / "Orientacje-arkusze" / "cache"
+    return here / ".cache"
+
+
 def parse_args(argv=None):
     here = Path(__file__).resolve().parent
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--szablon", type=Path, default=here / "szablon.dxf", help="plik szablonu DXF")
     p.add_argument("--wyniki", type=Path, default=here / "wyniki", help="katalog wynikowy")
     p.add_argument("--excel", type=Path, help="plik zestawienia (domyślnie <wyniki>/zestawienie_stacji.xlsx)")
-    p.add_argument("--cache", type=Path, default=here / ".cache", help="katalog cache (kafle, geokodowanie)")
+    p.add_argument("--cache", type=Path, default=default_cache_dir(here),
+                   help="katalog cache (kafle, geokodowanie); domyślnie poza OneDrive: %%LOCALAPPDATA%%\\Orientacje-arkusze")
     p.add_argument("--stacje", help="lista numerów stacji do wygenerowania, np. 541,664,1233")
 
     g = p.add_argument_group("arkusz")
@@ -1799,7 +1843,24 @@ def test_sources(opt) -> int:
         print(f"\nPillow: {PIL.__version__}")
     except ImportError:
         print("\nPillow: BRAK - zainstaluj: pip install pillow")
-        ok_any = False
+        return 0
+    print(f"Cache: {opt.cache_dir}")
+    print("\nPełna próba podkładu (pobranie + sklejenie + zapis PNG) dla działających źródeł:")
+    import tempfile
+    import traceback
+    out_dir = Path(tempfile.mkdtemp(prefix="orientacje_test_"))
+    for src, ok, _ in prov.test(lat, lon, zone, x, y, opt.zoom):
+        if not ok:
+            continue
+        p1 = BasemapProvider(opt.cache_dir, [src], opt.user_agent or DEFAULT_USER_AGENT, log=print)
+        bbox = (x - 300, y - 300, x + 300, y + 300)
+        try:
+            info = p1.render(bbox, zone, out_dir / f"test_{src.key}.png", opt.zoom, 2.0)
+            print(f"  [OK ] {src.key:<15} {info['width']}x{info['height']} px -> {info['path']}"
+                  + ("  (cache wyłączony - błąd zapisu)" if p1.cache_broken else ""))
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [BŁĄD] {src.key:<15} {type(exc).__name__}: {exc}")
+            traceback.print_exc()
     if not ok_any:
         print("\nŻadne źródło podkładu nie działa. Najczęstsze przyczyny: brak internetu, zapora/proxy"
               " firmowe, inspekcja SSL (spróbuj --bez-weryfikacji-ssl).")
