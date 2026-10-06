@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 from xml.sax.saxutils import escape
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 
 # ============================================================================
@@ -394,6 +394,129 @@ def mtext_plain(s: str) -> str:
 
 def mtext_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+
+
+# ---------------------------------------------------------------------------
+# dodawanie obrazu rastrowego (IMAGE) do szablonu, który go nie ma
+# ---------------------------------------------------------------------------
+_RASTER_CLASSES = (
+    ("IMAGE", "AcDbRasterImage", "ISM", 127, 1),
+    ("IMAGEDEF", "AcDbRasterImageDef", "ObjectDBX Classes", 0, 0),
+    ("IMAGEDEF_REACTOR", "AcDbRasterImageDefReactor", "ObjectDBX Classes", 1, 0),
+    ("RASTERVARIABLES", "AcDbRasterVariables", "ObjectDBX Classes", 0, 0),
+)
+
+
+def _dict_entries(ent: Entity) -> dict:
+    out, name = {}, None
+    for _, code, val in ent.items():
+        if code == 3:
+            name = val
+        elif code in (350, 360) and name is not None:
+            out[name] = val.strip()
+            name = None
+    return out
+
+
+def add_raster_image(doc: DxfDocument, layer: str = "0", file_name: str = "podklad.jpg") -> DxfDocument:
+    """Dodaje do przestrzeni modelu pusty obraz rastrowy (pod całym rysunkiem).
+
+    Tworzy IMAGE + IMAGEDEF + IMAGEDEF_REACTOR oraz brakujące wpisy CLASSES,
+    słownik ACAD_IMAGE_DICT i RASTERVARIABLES. Zwraca nowy, przeindeksowany dokument.
+    """
+    ms = next((e for e in doc.query("BLOCK_RECORD") if (e.get(2) or "").lower() == "*model_space"), None)
+    root = next((e for e in doc.query("DICTIONARY", section="OBJECTS")), None)
+    if ms is None or root is None:
+        raise ValueError("Szablon nie ma przestrzeni modelu albo słownika obiektów - nie mogę dodać obrazu")
+    first_ent = next((e for e in doc.query(section="ENTITIES")), None)
+    if first_ent is None:
+        raise ValueError("Szablon nie ma żadnych obiektów w sekcji ENTITIES")
+
+    # 1) definicje klas
+    have = {(e.get(1) or "").strip() for e in doc.query("CLASS")}
+    first_cls = next((e for e in doc.query("CLASS")), None)
+    if first_cls is not None:
+        for name, cpp, app, flags, was_proxy in _RASTER_CLASSES:
+            if name not in have:
+                doc.add_entity_before(first_cls, [
+                    (0, "CLASS"), (1, name), (2, cpp), (3, app), (90, f"{flags:>9}"),
+                    (91, "        1"), (280, "     0"), (281, f"{was_proxy:>6}")])
+
+    # 2) słowniki
+    rentries = _dict_entries(root)
+    after_root = doc.entities[doc.entities.index(root) + 1]
+    root_add = []
+    if "ACAD_IMAGE_DICT" in rentries:
+        img_dict_h = rentries["ACAD_IMAGE_DICT"]
+        img_dict = doc.by_handle.get(img_dict_h.upper())
+        after_dict = doc.entities[doc.entities.index(img_dict) + 1] if img_dict else None
+        new_dict = None
+    else:
+        img_dict_h = doc.new_handle()
+        root_add += [(3, "ACAD_IMAGE_DICT"), (350, img_dict_h)]
+        new_dict = img_dict_h
+        after_dict = None
+    vars_h = None
+    if "ACAD_IMAGE_VARS" not in rentries:
+        vars_h = doc.new_handle()
+        root_add += [(3, "ACAD_IMAGE_VARS"), (350, vars_h)]
+
+    image_h, def_h, react_h = doc.new_handle(), doc.new_handle(), doc.new_handle()
+    def_name = "podklad_osm"
+    if not new_dict and img_dict is not None:
+        i = 2
+        while def_name in _dict_entries(img_dict):
+            def_name, i = f"podklad_osm{i}", i + 1
+
+    # wpisy dopisywane na koniec istniejących słowników (przed następną encją)
+    if root_add:
+        doc.add_entity_before(after_root, root_add)
+    if after_dict is not None:
+        doc.add_entity_before(after_dict, [(3, def_name), (350, def_h)])
+
+    objs = []
+    if new_dict:
+        objs += [(0, "DICTIONARY"), (5, new_dict), (102, "{ACAD_REACTORS"), (330, root.handle), (102, "}"),
+                 (330, root.handle), (100, "AcDbDictionary"), (281, "     1"), (3, def_name), (350, def_h)]
+    if vars_h:
+        objs += [(0, "RASTERVARIABLES"), (5, vars_h), (102, "{ACAD_REACTORS"), (330, root.handle), (102, "}"),
+                 (330, root.handle), (100, "AcDbRasterVariables"), (90, "        0"), (70, "     0"),
+                 (71, "     1"), (72, "     3")]
+    objs += [(0, "IMAGEDEF"), (5, def_h), (102, "{ACAD_REACTORS"), (330, img_dict_h), (330, react_h), (102, "}"),
+             (330, img_dict_h), (100, "AcDbRasterImageDef"), (90, "        0"), (1, file_name),
+             (10, "1.0"), (20, "1.0"), (11, "1.0"), (21, "1.0"), (280, "     1"), (281, "     0"),
+             (0, "IMAGEDEF_REACTOR"), (5, react_h), (330, image_h), (100, "AcDbRasterImageDefReactor"),
+             (90, "        2"), (330, image_h)]
+    doc.add_entity_before(after_root, objs)
+
+    # 3) encja IMAGE - jako pierwsza w ENTITIES (rysowana pod wszystkim)
+    doc.add_entity_before(first_ent, [
+        (0, "IMAGE"), (5, image_h), (330, ms.handle), (100, "AcDbEntity"), (8, layer),
+        (100, "AcDbRasterImage"), (90, "        0"),
+        (10, "0.0"), (20, "0.0"), (30, "0.0"), (11, "1.0"), (21, "0.0"), (31, "0.0"),
+        (12, "0.0"), (22, "1.0"), (32, "0.0"), (13, "1.0"), (23, "1.0"),
+        (340, def_h), (70, "     7"), (280, "     0"), (281, "    50"), (282, "    50"), (283, "     0"),
+        (360, react_h), (71, "     1"), (91, "        2"), (14, "-0.5"), (24, "-0.5"), (14, "0.5"), (24, "0.5"),
+        (290, "     0")])
+
+    # 4) kolejność rysowania: jeśli model ma SORTENTSTABLE, obraz dostaje najniższy klucz
+    for st in doc.query("SORTENTSTABLE", section="OBJECTS"):
+        owner = None
+        seen_subclass = False
+        for _, code, val in st.items():
+            if code == 100 and val.strip() == "AcDbSortentsTable":
+                seen_subclass = True
+            elif seen_subclass and code == 330:
+                owner = val.strip().upper()
+                break
+        if owner != ms.handle.upper():
+            continue
+        keys = [int(v.strip(), 16) for v in st.values(5)[1:] if v.strip()]
+        low = max(1, min(keys + [int(first_ent.handle, 16)]) - 1)
+        nxt = doc.entities[doc.entities.index(st) + 1]
+        doc.add_entity_before(nxt, [(331, image_h), (5, format(low, "X"))])
+        break
+    return DxfDocument(doc.to_bytes())
 
 
 # ============================================================================
@@ -817,12 +940,8 @@ BASEMAP_SOURCES = {s.key: s for s in (
                   "https://mapy.geoportal.gov.pl/wss/service/PZGIK/ORTO/WMS/StandardResolution",
                   "Podkład mapowy: ortofotomapa © GUGiK (geoportal.gov.pl)",
                   layers="Raster", image_format="image/jpeg"),
-    BasemapSource("geoportal-orto2", "Geoportal.gov.pl - ortofotomapa (WMS, adres zapasowy)", "wms",
-                  "https://mapy.geoportal.gov.pl/wss/service/img/guest/ORTO/MapServer/WMSServer",
-                  "Podkład mapowy: ortofotomapa © GUGiK (geoportal.gov.pl)",
-                  layers="Raster", image_format="image/jpeg"),
 )}
-DEFAULT_SOURCE_ORDER = ("osm", "osm-de", "osm-fr", "carto", "opentopomap", "esri", "geoportal-orto", "geoportal-orto2")
+DEFAULT_SOURCE_ORDER = ("osm", "osm-de", "osm-fr", "carto", "opentopomap", "esri", "geoportal-orto")
 
 _IMAGE_MAGIC = (b"\x89PNG", b"\xff\xd8\xff", b"GIF8", b"RIFF", b"II*\x00", b"MM\x00*")
 
@@ -931,7 +1050,7 @@ class BasemapProvider:
                     if im.size != (ts, ts):
                         im = im.resize((ts, ts))
                     mosaic.paste(im, ((tx - tx0) * ts, (ty - ty0) * ts))
-        if n_tiles >= 4 and len(hashes) == 1:
+        if n_tiles >= 16 and len(hashes) == 1:
             # serwer odsyła wszędzie ten sam kafel: "Access blocked" albo pusty obraz
             for tx in range(tx0, tx1 + 1):
                 for ty in range(ty0, ty1 + 1):
@@ -1419,6 +1538,11 @@ class Generator:
         self.opt = opt
         self.log = log
         self.template = DxfDocument.load(opt.template)
+        self.image_added = False
+        if opt.basemap and not any(not e.paperspace for e in self.template.query("IMAGE", section="ENTITIES")):
+            layers = {(e.get(2) or "").strip() for e in self.template.query("LAYER")}
+            self.template = add_raster_image(self.template, "!podklad" if "!podklad" in layers else "0")
+            self.image_added = True
         self.layout = SheetLayout.from_doc(self.template)
         self.stations = find_stations(self.template, opt.zone_layer)
         if not self.stations:
@@ -1553,6 +1677,8 @@ class Generator:
                 self._apply_basemap(doc, st, cx, cy)
             else:
                 self._relink_template_image(doc)
+        elif self.basemap is not None:
+            st.notes.append("podkład pominięty: w szablonie nie ma obrazu rastrowego")
         doc.save(opt.out_dir / st.dxf_name)
 
     def _apply_basemap(self, doc, st, cx, cy):
@@ -1632,6 +1758,11 @@ class Generator:
             self.log("Źródła podkładu (po kolei): " + ", ".join(s.key for s in self.basemap.sources))
         self.log(f"Szablon: {opt.template}  |  układ PL-2000 strefa {self.zone} (EPSG:{epsg_for_zone(self.zone)})")
         self.log(f"Znaleziono stacji: {len(self.stations)}, do wygenerowania: {len(todo)}")
+        if self.image_added:
+            self.log("Szablon nie ma obrazu rastrowego - dodałem obraz podkładu pod rysunkiem (warstwa "
+                     f"{self.image.layer or '0'})")
+        elif self.image is None:
+            self.log("UWAGA: szablon nie ma obrazu rastrowego - arkusze będą bez podkładu")
         self.log(f"Tabelka: znacznik '{self.station_placeholder}', miejscowość w szablonie '{self.template_place}'")
         for st in todo:
             self.resolve_place(st)
@@ -1859,7 +1990,7 @@ def test_sources(opt) -> int:
         print("\nPillow: BRAK - zainstaluj: pip install pillow")
         return 0
     print(f"Cache: {opt.cache_dir}")
-    print("\nPełna próba podkładu (pobranie + sklejenie + zapis PNG) dla działających źródeł:")
+    print("\nPełna próba podkładu (pobranie + sklejenie + zapis pliku) dla działających źródeł:")
     import tempfile
     import traceback
     out_dir = Path(tempfile.mkdtemp(prefix="orientacje_test_"))

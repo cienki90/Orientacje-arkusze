@@ -96,16 +96,19 @@ oraz **Nazwy ze wszystkich źródeł**. Przy rozbieżności w uwagach jest „SP
 ## Podkład mapowy – źródła zapasowe
 
 Źródła są próbowane po kolei (`--zrodla-podkladu`, lista: `--lista-zrodel`):
-`osm` → `osm-de` → `osm-fr` → `carto` → `opentopomap` → `esri` → `geoportal-orto` → `geoportal-orto2`
+`osm` → `osm-de` → `osm-fr` → `carto` → `opentopomap` → `esri` → `geoportal-orto`
 (ortofotomapa GUGiK z WMS, od razu w PL-2000). Jeden arkusz zawsze pochodzi
 z jednego źródła. Źródło, które zawiedzie (błąd sieci, odmowa, odpowiedź
 niebędąca obrazem), jest pomijane przy kolejnych arkuszach. Użyte źródło
 widać w kolumnie **Źródło podkładu**. Gdy nie działa żadne, w arkuszu zostaje
 `orientacja.png` z szablonu. `--serwer-kafli URL` dodaje własny serwer na początek listy.
 
+Szablon nie musi zawierać obrazu `orientacja.png`. Jeśli nie ma w nim żadnego obrazu
+rastrowego, program sam dodaje obraz podkładu pod rysunkiem (na warstwie `!podklad`).
+
 ### Gdy podkład się nie pobiera
 
-1. Sprawdź wersję – na początku program wypisuje `Generator arkuszy v1.3.0`
+1. Sprawdź wersję – na początku program wypisuje `Generator arkuszy v1.3.1`
    i listę źródeł podkładu. Jeśli tego nie widać, uruchamiasz starą wersję pliku.
 2. Uruchom diagnostykę: `python generuj_arkusze.py --test-zrodel`. Program pobierze po jednym
    kaflu z każdego źródła i wypisze `[OK]` / `[BŁĄD]` z przyczyną (także dla źródeł nazw i Pillow).
