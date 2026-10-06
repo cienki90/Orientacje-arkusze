@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 from xml.sax.saxutils import escape
 
-__version__ = "1.2.2"
+__version__ = "1.3.0"
 
 
 # ============================================================================
@@ -863,6 +863,7 @@ class BasemapProvider:
         self.downloaded: dict[str, int] = {}
         self.from_cache: dict[str, int] = {}
         self.refresh = False                    # True = ignoruj cache, pobierz od nowa
+        self.jpeg_quality = 90
         self.cache_broken = False               # zapis cache się nie udał - tylko pamięć
         self.error_log: Path | None = None
 
@@ -996,7 +997,7 @@ class BasemapProvider:
     def render(self, bbox, zone: int, out_png: Path, zoom: int = 16, resolution: float = 1.0):
         """Tworzy podkład dla prostokąta bbox=(xmin,ymin,xmax,ymax) w PL-2000.
 
-        Zapisuje PNG + plik georeferencji .pgw i zwraca słownik z parametrami
+        Zapisuje JPG (.jgw) albo PNG (.pgw) - wg rozszerzenia out_png - i zwraca słownik z parametrami
         obrazu oraz użytym źródłem. Gdy żadne źródło nie działa - OsmError.
         """
         _require_pillow()
@@ -1046,12 +1047,16 @@ class BasemapProvider:
     def _save(self, img, out_png, bbox, width, height, resolution, src):
         out_png = Path(out_png)
         out_png.parent.mkdir(parents=True, exist_ok=True)
+        is_jpg = out_png.suffix.lower() in (".jpg", ".jpeg")
         try:
-            img.save(out_png, optimize=True)
+            if is_jpg:
+                img.save(out_png, "JPEG", quality=self.jpeg_quality, optimize=True)
+            else:
+                img.save(out_png, "PNG", optimize=True)
         except OSError as exc:
             raise OSError(f"nie mogę zapisać {out_png}: {exc} (plik otwarty w innym programie "
                           "lub zablokowany przez OneDrive?)") from exc
-        out_png.with_suffix(".pgw").write_text(            # środek lewego górnego piksela
+        out_png.with_suffix(".jgw" if is_jpg else ".pgw").write_text(            # środek lewego górnego piksela
             "\n".join(f"{v:.10f}" for v in (resolution, 0.0, 0.0, -resolution,
                                              bbox[0] + resolution / 2, bbox[3] - resolution / 2)) + "\n")
         return {"path": out_png, "width": width, "height": height, "xmin": bbox[0], "ymin": bbox[1],
@@ -1371,6 +1376,7 @@ class Options:
     zoom: int = 16
     resolution: float = 1.0
     basemap_margin: float = 0.15
+    basemap_format: str = "jpg"
     tile_url: str | None = None
     basemap_sources: tuple = DEFAULT_SOURCE_ORDER
     refresh_basemap: bool = False
@@ -1554,7 +1560,8 @@ class Generator:
         w, h = self.layout.model_size(st.scale)
         k = 1 + 2 * opt.basemap_margin
         bbox = (cx - w * k / 2, cy - h * k / 2, cx + w * k / 2, cy + h * k / 2)
-        png = opt.out_dir / f"{Path(st.dxf_name).stem}_podklad.png"
+        ext = "png" if opt.basemap_format.lower() == "png" else "jpg"
+        png = opt.out_dir / f"{Path(st.dxf_name).stem}_podklad.{ext}"
         try:
             info = self.basemap.render(bbox, self.zone, png, opt.zoom, opt.resolution)
         except Exception as exc:  # noqa: BLE001
@@ -1747,6 +1754,8 @@ def parse_args(argv=None):
                    help="nie sprawdzaj certyfikatów HTTPS (sieci firmowe z inspekcją SSL)")
     g.add_argument("--zoom", type=int, default=16, help="poziom kafli OSM (domyślnie 16, max 19)")
     g.add_argument("--rozdzielczosc", type=float, default=1.0, help="rozmiar piksela podkładu w m (domyślnie 1.0)")
+    g.add_argument("--format-podkladu", choices=("jpg", "png"), default="jpg",
+                   help="format pliku podkładu (domyślnie jpg - mniejszy, dobrze czytany przez GstarCAD/AutoCAD)")
     g.add_argument("--margines-podkladu", type=float, default=0.15,
                    help="zapas podkładu poza rzutnią, ułamek wymiaru (domyślnie 0.15)")
     g.add_argument("--serwer-kafli", help="własny serwer kafli {z}/{x}/{y} - próbowany jako pierwszy")
@@ -1793,6 +1802,7 @@ def main(argv=None) -> int:
         template=a.szablon, out_dir=a.wyniki, excel=a.excel or a.wyniki / "zestawienie_stacji.xlsx",
         cache_dir=a.cache, scale=a.skala, fixed_scale=a.stala_skala, basemap=not a.bez_podkladu,
         zoom=a.zoom, resolution=a.rozdzielczosc, basemap_margin=a.margines_podkladu,
+        basemap_format=a.format_podkladu,
         tile_url=a.serwer_kafli, basemap_sources=tuple(a.zrodla_podkladu.split(",")), user_agent=a.user_agent, geocode=not a.bez_geokodowania,
         place_sources=tuple(a.zrodla_nazw.split(",")), verify_places=not a.bez_weryfikacji_nazw,
         majority_place=a.nazwa_wg_wiekszosci, refresh_basemap=a.odswiez_podklad,
@@ -1859,7 +1869,7 @@ def test_sources(opt) -> int:
         p1 = BasemapProvider(opt.cache_dir, [src], opt.user_agent or DEFAULT_USER_AGENT, log=print)
         bbox = (x - 300, y - 300, x + 300, y + 300)
         try:
-            info = p1.render(bbox, zone, out_dir / f"test_{src.key}.png", opt.zoom, 2.0)
+            info = p1.render(bbox, zone, out_dir / f"test_{src.key}.jpg", opt.zoom, 2.0)
             print(f"  [OK ] {src.key:<15} {info['width']}x{info['height']} px -> {info['path']}"
                   + ("  (cache wyłączony - błąd zapisu)" if p1.cache_broken else ""))
         except Exception as exc:  # noqa: BLE001

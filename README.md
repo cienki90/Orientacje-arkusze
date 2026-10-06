@@ -16,7 +16,7 @@ Dla każdej stacji program:
 5. **Usuwa odnośniki i obrysy pozostałych stacji** razem z odwołaniami
    w SORTENTSTABLE i reaktorach, żeby w pliku nie zostały wiszące uchwyty.
 6. **Pobiera podkład mapowy** (najpierw OpenStreetMap, a gdy nie działa – kolejne
-   źródła), przelicza go do PL-2000 i zapisuje jako `541_podklad.png` + `.pgw`,
+   źródła), przelicza go do PL-2000 i zapisuje jako `541_podklad.jpg` + `.jgw` (albo PNG: `--format-podkladu png`),
    potem podpina ten obraz w miejsce `orientacja.png`. Na arkuszu dopisuje
    atrybucję właściwą dla użytego źródła.
 7. Zapisuje `wyniki/541.dxf` i dopisuje wiersz do `wyniki/zestawienie_stacji.xlsx`.
@@ -47,7 +47,7 @@ Wyniki trafiają do katalogu `wyniki/`:
 ```
 wyniki/
   541.dxf, 664.dxf, ...           plany orientacyjne
-  541_podklad.png / .pgw, ...     podkład OSM dla każdego arkusza (trzymaj obok DXF)
+  541_podklad.jpg / .jgw, ...     podkład mapowy dla każdego arkusza (trzymaj obok DXF)
   zestawienie_stacji.xlsx         zestawienie stacji
 ```
 
@@ -105,7 +105,7 @@ widać w kolumnie **Źródło podkładu**. Gdy nie działa żadne, w arkuszu zos
 
 ### Gdy podkład się nie pobiera
 
-1. Sprawdź wersję – na początku program wypisuje `Generator arkuszy v1.2.2`
+1. Sprawdź wersję – na początku program wypisuje `Generator arkuszy v1.3.0`
    i listę źródeł podkładu. Jeśli tego nie widać, uruchamiasz starą wersję pliku.
 2. Uruchom diagnostykę: `python generuj_arkusze.py --test-zrodel`. Program pobierze po jednym
    kaflu z każdego źródła i wypisze `[OK]` / `[BŁĄD]` z przyczyną (także dla źródeł nazw i Pillow).
