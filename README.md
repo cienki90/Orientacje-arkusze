@@ -25,7 +25,9 @@ tabelka, układy, obiekty proxy) zostaje bez zmian.
 
 ## Instalacja
 
-Wymagany Python 3.10+. Jedyna zależność to Pillow (do podkładu mapowego):
+Cały program to jeden plik `generuj_arkusze.py`. Wystarczy go położyć obok
+`szablon.dxf` (i `orientacja.png`). Wymagany Python 3.10+. Jedyna zależność
+to Pillow (do podkładu mapowego):
 
 ```
 pip install -r requirements.txt
