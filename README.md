@@ -96,7 +96,7 @@ oraz **Nazwy ze wszystkich źródeł**. Przy rozbieżności w uwagach jest „SP
 ## Podkład mapowy – źródła zapasowe
 
 Źródła są próbowane po kolei (`--zrodla-podkladu`, lista: `--lista-zrodel`):
-`osm` → `osm-de` → `osm-fr` → `carto` → `opentopomap` → `esri` → `geoportal-orto`
+`osm` → `osm-de` → `osm-fr` → `carto` → `opentopomap` → `esri` → `geoportal-orto` → `geoportal-orto2`
 (ortofotomapa GUGiK z WMS, od razu w PL-2000). Jeden arkusz zawsze pochodzi
 z jednego źródła. Źródło, które zawiedzie (błąd sieci, odmowa, odpowiedź
 niebędąca obrazem), jest pomijane przy kolejnych arkuszach. Użyte źródło

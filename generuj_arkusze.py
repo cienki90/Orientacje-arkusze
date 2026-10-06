@@ -817,8 +817,12 @@ BASEMAP_SOURCES = {s.key: s for s in (
                   "https://mapy.geoportal.gov.pl/wss/service/PZGIK/ORTO/WMS/StandardResolution",
                   "Podkład mapowy: ortofotomapa © GUGiK (geoportal.gov.pl)",
                   layers="Raster", image_format="image/jpeg"),
+    BasemapSource("geoportal-orto2", "Geoportal.gov.pl - ortofotomapa (WMS, adres zapasowy)", "wms",
+                  "https://mapy.geoportal.gov.pl/wss/service/img/guest/ORTO/MapServer/WMSServer",
+                  "Podkład mapowy: ortofotomapa © GUGiK (geoportal.gov.pl)",
+                  layers="Raster", image_format="image/jpeg"),
 )}
-DEFAULT_SOURCE_ORDER = ("osm", "osm-de", "osm-fr", "carto", "opentopomap", "esri", "geoportal-orto")
+DEFAULT_SOURCE_ORDER = ("osm", "osm-de", "osm-fr", "carto", "opentopomap", "esri", "geoportal-orto", "geoportal-orto2")
 
 _IMAGE_MAGIC = (b"\x89PNG", b"\xff\xd8\xff", b"GIF8", b"RIFF", b"II*\x00", b"MM\x00*")
 
