@@ -3,7 +3,7 @@
 Kazdy arkusz (paperspace, w kolejnosci zakladek) = jedna strona PDF.
 Uzycie:  py dxf2pdf.py                      - okno z wyborem folderow
          py dxf2pdf.py <folder_dxf> [<folder_pdf>]   - bez okna (domyslnie PDF obok DXF)
-Wymaga:  pip install ezdxf pymupdf
+Wymaga:  pip install ezdxf pymupdf pillow
 """
 import os
 import pathlib

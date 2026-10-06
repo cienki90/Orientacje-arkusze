@@ -25,7 +25,7 @@ jobs:
           python-version: "3.12"
 
       - name: Instalacja
-        run: python -m pip install --upgrade pip pyinstaller ezdxf pymupdf
+        run: python -m pip install --upgrade pip pyinstaller ezdxf pymupdf pillow
 
       - name: Budowanie DXF2PDF.exe
         run: pyinstaller --onefile --windowed --name DXF2PDF --collect-all ezdxf narzedzia/dxf2pdf.py
