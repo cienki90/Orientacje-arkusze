@@ -24,6 +24,15 @@ Dla każdej stacji program:
 Plik DXF jest edytowany na poziomie tagów, więc reszta szablonu (style,
 tabelka, układy, obiekty proxy) zostaje bez zmian.
 
+## Wersja exe (bez instalowania Pythona)
+
+Pobierz `GeneratorArkuszy.exe` z zakładki **Releases**
+(https://github.com/cienki90/Orientacje-arkusze/releases/latest), połóż obok `szablon.dxf`
+i uruchom dwuklikiem. Możesz też przeciągnąć dowolny plik `.dxf` na ikonę programu –
+wyniki trafią do folderu `wyniki` obok tego pliku. Wszystkie opcje opisane niżej działają
+tak samo, np. `GeneratorArkuszy.exe --test-zrodel`. Exe jest budowany automatycznie
+(GitHub Actions) i przed publikacją testowany na prawdziwych serwerach OSM.
+
 ## Instalacja
 
 Cały program to jeden plik `generuj_arkusze.py`. Wystarczy go położyć obok
