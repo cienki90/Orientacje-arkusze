@@ -27,6 +27,10 @@ py dxf2pdf.py "C:\sciezka\do\folderu\z\dxf"
 Warstwy z wyłączonym drukowaniem oraz `Defpoints` nie trafiają do PDF-a, tak samo jak przy wydruku z CAD-a.
 Ten wariant jest szybszy, ale odwzorowanie może być trochę słabsze niż w CAD-zie, np. fonty SHX i grubości linii z CTB.
 
+Rozmiar PDF-a: podkład jest zapisywany jako JPG, w rozdzielczości 200 DPI i jakości 75. Współrzędne wektorów są zaokrąglane do 0,01 pt.
+Ustawienia są w `DPI_PODKLADU`, `JAKOSC_JPG` i `MIEJSCA_PO_PRZECINKU` na górze `dxf2pdf.py`.
+PDF będzie i tak większy niż z GstarCAD-a, bo ezdxf zapisuje teksty jako krzywe, a nie jako font.
+
 ## Uwaga: `orientacja.png`
 Rysunki szukają podkładu pod ścieżką `..\orientacja.png`, czyli w folderze **wyżej** niż DXF.
 W wariancie A plik PNG musi tam leżeć albo trzeba poprawić ścieżkę obrazu w szablonie.
