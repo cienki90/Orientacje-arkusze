@@ -31,8 +31,9 @@ Exe jest budowane automatycznie przez GitHub Actions (`.github/workflows/build-d
 ## Wariant B bez exe (Python)
 
 ```
-py -m pip install ezdxf pymupdf
-py dxf2pdf.py "C:\sciezka\do\folderu\z\dxf"
+py -m pip install ezdxf pymupdf pillow
+py dxf2pdf.py                                  (okno z wyborem folderów)
+py dxf2pdf.py "C:\folder\z\dxf" "C:\folder\na\pdf"
 ```
 Warstwy z wyłączonym drukowaniem oraz `Defpoints` nie trafiają do PDF-a, tak samo jak przy wydruku z CAD-a.
 Ten wariant jest szybszy, ale odwzorowanie może być trochę słabsze niż w CAD-zie, np. fonty SHX i grubości linii z CTB.
