@@ -18,7 +18,17 @@ Każdy kolejny raz:
 
 GstarCAD otworzy każdy plik, wydrukuje arkusze do `_strony\` i zamknie go. Na końcu `scal_pdf.py` połączy strony w jeden plik `<nazwa>.pdf` i usunie `_strony\`.
 
-## Wariant B: bez CAD-a (Python)
+## Wariant B: bez CAD-a — `DXF2PDF.exe` (bez instalowania Pythona)
+
+Pobierz `DXF2PDF.exe` z zakładki **Releases** (https://github.com/cienki90/Orientacje-arkusze/releases) i uruchom dwuklikiem:
+1. **Folder z plikami DXF** → `Wybierz...`
+2. **Folder na pliki PDF** → `Wybierz...` (domyślnie ten sam folder co DXF)
+3. `Konwertuj`, a na końcu `Otwórz folder PDF`.
+
+Program pamięta ostatnio wybrane foldery. Można go też uruchomić bez okna: `DXF2PDF.exe "C:\dxf" "C:\pdf"`. Dziennik trafia wtedy do `dxf2pdf_log.txt` w folderze PDF.
+Exe jest budowane automatycznie przez GitHub Actions (`.github/workflows/build-dxf2pdf-exe.yml`) i testowane na DXF-ach z repo. Nowe wydanie powstaje po wypchnięciu tagu `dxf2pdf-v*`.
+
+## Wariant B bez exe (Python)
 
 ```
 py -m pip install ezdxf pymupdf
