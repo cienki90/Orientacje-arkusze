@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 from xml.sax.saxutils import escape
 
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 
 
 # ============================================================================
@@ -1842,10 +1842,19 @@ def default_cache_dir(here: Path) -> Path:
     return here / ".cache"
 
 
+def program_dir() -> Path:
+    """Folder programu: przy .exe (PyInstaller) - folder pliku exe, inaczej - folder skryptu."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
 def parse_args(argv=None):
-    here = Path(__file__).resolve().parent
+    here = program_dir()
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--szablon", type=Path, default=here / "szablon.dxf", help="plik szablonu DXF")
+    p.add_argument("plik", nargs="?", type=Path,
+                   help="szablon DXF (można przeciągnąć plik .dxf na ikonę programu); domyślnie szablon.dxf obok programu")
+    p.add_argument("--szablon", type=Path, help="plik szablonu DXF (domyślnie szablon.dxf obok programu)")
     p.add_argument("--wyniki", type=Path, default=here / "wyniki", help="katalog wynikowy")
     p.add_argument("--excel", type=Path, help="plik zestawienia (domyślnie <wyniki>/zestawienie_stacji.xlsx)")
     p.add_argument("--cache", type=Path, default=default_cache_dir(here),
@@ -1910,6 +1919,10 @@ def main(argv=None) -> int:
         except AttributeError:
             pass
     a = parse_args(argv)
+    here = program_dir()
+    a.szablon = a.szablon or a.plik or here / "szablon.dxf"
+    if a.plik and a.wyniki == here / "wyniki":
+        a.wyniki = Path(a.plik).resolve().parent / "wyniki"      # wyniki obok przeciągniętego szablonu
     if a.bez_weryfikacji_ssl:
         import ssl
         global SSL_CONTEXT
@@ -1945,11 +1958,26 @@ def main(argv=None) -> int:
     if a.test_zrodel:
         return test_sources(opt)
     try:
+        if not Path(opt.template).exists():
+            raise ValueError(f"Nie ma pliku szablonu: {opt.template}\n"
+                             "Połóż szablon.dxf obok programu albo przeciągnij plik .dxf na ikonę programu.")
         Generator(opt).run()
     except (ValueError, OSError) as exc:
         print(f"BŁĄD: {exc}", file=sys.stderr)
         return 1
     return 0
+
+
+def _pause_if_double_clicked():
+    """Exe uruchomiony dwuklikiem: nie zamykaj okna od razu."""
+    if getattr(sys, "frozen", False) and os.name == "nt" and not os.environ.get("ORIENTACJE_BEZ_PAUZY"):
+        try:
+            import ctypes
+            # jeśli w konsoli jest tylko ten proces, to okno powstało dla nas (dwuklik)
+            if ctypes.windll.kernel32.GetConsoleProcessList((ctypes.c_uint * 4)(), 4) <= 2:
+                input("\nNaciśnij Enter, aby zamknąć...")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def test_sources(opt) -> int:
@@ -2013,4 +2041,6 @@ def test_sources(opt) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    code = main()
+    _pause_if_double_clicked()
+    sys.exit(code)
