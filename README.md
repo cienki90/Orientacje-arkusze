@@ -103,11 +103,14 @@ widać w kolumnie **Źródło podkładu**. Gdy nie działa żadne, w arkuszu zos
 
 ### Gdy podkład się nie pobiera
 
-1. Sprawdź wersję – na początku program wypisuje `Generator arkuszy v1.2.0`
+1. Sprawdź wersję – na początku program wypisuje `Generator arkuszy v1.2.1`
    i listę źródeł podkładu. Jeśli tego nie widać, uruchamiasz starą wersję pliku.
 2. Uruchom diagnostykę: `python generuj_arkusze.py --test-zrodel`. Program pobierze po jednym
    kaflu z każdego źródła i wypisze `[OK]` / `[BŁĄD]` z przyczyną (także dla źródeł nazw i Pillow).
 3. W sieci firmowej z inspekcją SSL spróbuj `--bez-weryfikacji-ssl`.
+4. Na końcu program wypisuje blok `PODKŁAD MAPOWY: N/M arkuszy z nowym podkładem` – ile
+   fragmentów pobrano z internetu, ile wzięto z cache (`.cache/kafle`), które źródła wyłączono
+   i dlaczego każdy arkusz bez podkładu go nie dostał. `--odswiez-podklad` ignoruje cache.
 
 Źródło jest wyłączane do końca przebiegu tylko przy odmowie serwera (HTTP 403/404…),
 odpowiedzi niebędącej obrazem albo gdy wszystkie kafle są identyczne (kafel „Access blocked”).

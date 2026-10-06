@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 from xml.sax.saxutils import escape
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 
 # ============================================================================
@@ -851,12 +851,15 @@ class BasemapProvider:
         self.dead: dict[str, str] = {}          # klucz źródła -> powód (pomijane do końca)
         self.soft_fail: dict[str, int] = {}     # chwilowe błędy (timeout itp.) - ile arkuszy z rzędu
         self.downloaded: dict[str, int] = {}
+        self.from_cache: dict[str, int] = {}
+        self.refresh = False                    # True = ignoruj cache, pobierz od nowa
         self.error_log: Path | None = None
 
     # --- pobieranie z cache ------------------------------------------------------
     def _cached(self, src: BasemapSource, rel: str, url: str) -> bytes:
         path = self.cache_dir / "kafle" / src.key / rel
-        if path.exists() and path.stat().st_size > 0:
+        if not self.refresh and path.exists() and path.stat().st_size > 0:
+            self.from_cache[src.key] = self.from_cache.get(src.key, 0) + 1
             return path.read_bytes()
         data = _check_image(_http_get(url, self.user_agent, timeout=20, retries=2), url)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1331,6 +1334,7 @@ class Options:
     basemap_margin: float = 0.15
     tile_url: str | None = None
     basemap_sources: tuple = DEFAULT_SOURCE_ORDER
+    refresh_basemap: bool = False
     user_agent: str | None = None
     geocode: bool = True
     place_sources: tuple = DEFAULT_PLACE_ORDER
@@ -1393,6 +1397,7 @@ class Generator:
                                            resolve_sources(opt.basemap_sources, opt.tile_url),
                                            opt.user_agent or DEFAULT_USER_AGENT, log=log)
             self.basemap.error_log = opt.out_dir / "bledy_podkladu.log"
+            self.basemap.refresh = opt.refresh_basemap
 
     # --- analiza szablonu ----------------------------------------------------
     def _table_entities(self, doc):
@@ -1590,12 +1595,37 @@ class Generator:
                      f"{st.dxf_name}{extra}" + (f"   [{'; '.join(st.notes)}]" if st.notes else ""))
         self.write_excel(todo)
         if self.basemap is not None:
-            got = ", ".join(f"{k}: {v}" for k, v in self.basemap.downloaded.items()) or "0 (wszystko z cache)"
-            self.log(f"Pobrane fragmenty podkładu: {got}")
-            for k, why in self.basemap.dead.items():
-                self.log(f"  niedziałające źródło {k}: {why}")
+            self._basemap_summary(todo)
         self.log(f"Zestawienie: {opt.excel}")
         return todo
+
+    def _basemap_summary(self, todo):
+        bm = self.basemap
+        ok = [st for st in todo if st.basemap_name]
+        per_src = {}
+        for st in ok:
+            per_src[st.basemap_source] = per_src.get(st.basemap_source, 0) + 1
+        self.log("")
+        self.log(f"PODKŁAD MAPOWY: {len(ok)}/{len(todo)} arkuszy z nowym podkładem"
+                 + (" - " + ", ".join(f"{k}: {v}" for k, v in per_src.items()) if per_src else ""))
+        keys = sorted(set(bm.downloaded) | set(bm.from_cache))
+        if keys:
+            self.log("  fragmenty: " + ", ".join(
+                f"{k}: {bm.downloaded.get(k, 0)} pobranych z internetu, {bm.from_cache.get(k, 0)} z cache"
+                for k in keys) + f"  (cache: {bm.cache_dir / 'kafle'})")
+        else:
+            self.log("  nie pobrano ani nie wczytano z cache żadnego fragmentu mapy")
+        for k, why in bm.dead.items():
+            self.log(f"  wyłączone źródło {k}: {why}")
+        for st in todo:
+            if not st.basemap_name:
+                why = next((n for n in st.notes if n.startswith("podkład")), "brak podkładu")
+                self.log(f"  {st.designation}: {why}")
+        if not ok:
+            self.log("  >>> Żaden arkusz nie dostał podkładu. Uruchom: python generuj_arkusze.py --test-zrodel")
+        elif keys and not any(bm.downloaded.values()):
+            self.log("  (wszystko wzięte z cache z poprzedniego uruchomienia; "
+                     "aby pobrać od nowa: --odswiez-podklad)")
 
     def write_excel(self, stations):
         cols = [("Lp.", 5, "int"), ("Oznaczenie stacji", 12, None), ("Nr stacji", 9, "int"),
@@ -1661,6 +1691,8 @@ def parse_args(argv=None):
                    help="kolejność źródeł podkładu, próbowanych gdy poprzednie zawiedzie "
                         f"(domyślnie: {','.join(DEFAULT_SOURCE_ORDER)})")
     g.add_argument("--lista-zrodel", action="store_true", help="pokaż dostępne źródła podkładu i nazw, i zakończ")
+    g.add_argument("--odswiez-podklad", action="store_true",
+                   help="nie używaj zapisanych kafli (cache), pobierz podkład od nowa")
     g.add_argument("--test-zrodel", action="store_true",
                    help="sprawdź, które źródła podkładu i nazw odpowiadają z tego komputera, i zakończ")
     g.add_argument("--bez-weryfikacji-ssl", action="store_true",
@@ -1715,7 +1747,7 @@ def main(argv=None) -> int:
         zoom=a.zoom, resolution=a.rozdzielczosc, basemap_margin=a.margines_podkladu,
         tile_url=a.serwer_kafli, basemap_sources=tuple(a.zrodla_podkladu.split(",")), user_agent=a.user_agent, geocode=not a.bez_geokodowania,
         place_sources=tuple(a.zrodla_nazw.split(",")), verify_places=not a.bez_weryfikacji_nazw,
-        majority_place=a.nazwa_wg_wiekszosci,
+        majority_place=a.nazwa_wg_wiekszosci, refresh_basemap=a.odswiez_podklad,
         names_csv=a.nazwy, only=only, keep_other_stations=a.zostaw_inne_stacje,
         zone_layer=a.warstwa_obrysow, table_block=a.blok_tabelki,
         place_phrase=a.fraza_miejscowosci, station_placeholder=a.znacznik_stacji,
