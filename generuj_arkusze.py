@@ -506,10 +506,9 @@ def write_xlsx(path, sheet_name: str, columns, rows):
 
 
 # ============================================================================
-# OPENSTREETMAP: NOMINATIM I KAFLE
+# OPENSTREETMAP (NOMINATIM) I PODKŁAD MAPOWY
 # ============================================================================
 DEFAULT_USER_AGENT = "Orientacje-arkusze/1.0 (generator planow orientacyjnych DXF)"
-DEFAULT_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/reverse"
 
 # Kolejność pól adresu Nominatim, z których bierzemy "miejscowość"
@@ -521,98 +520,297 @@ class OsmError(RuntimeError):
     pass
 
 
-def _http_get(url: str, user_agent: str, timeout: int = 30) -> bytes:
+def _http_get(url: str, user_agent: str, timeout: int = 30, retries: int = 3) -> bytes:
+    import urllib.error
     req = urllib.request.Request(url, headers={"User-Agent": user_agent,
                                                "Accept-Language": "pl"})
     last = None
-    for attempt in range(3):
+    for attempt in range(retries):
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return r.read()
+        except urllib.error.HTTPError as exc:
+            last = exc
+            if exc.code in (400, 401, 403, 404, 410):     # nie ma sensu ponawiać
+                break
         except Exception as exc:          # noqa: BLE001 - ponawiamy każdą awarię sieci
             last = exc
+        if attempt + 1 < retries:
             time.sleep(1.5 * (attempt + 1))
     raise OsmError(f"Nie udało się pobrać {url}: {last}")
 
 
 # ---------------------------------------------------------------------------
-# Nominatim
+# Nazwy miejscowości - kilka niezależnych źródeł
 # ---------------------------------------------------------------------------
-class Geocoder:
-    def __init__(self, cache_dir: Path, user_agent: str = DEFAULT_USER_AGENT,
-                 place_keys=PLACE_KEYS):
-        self.cache_path = Path(cache_dir) / "nominatim.json"
+PLACE_SOURCE_NAMES = {
+    "nominatim": "OSM Nominatim",
+    "overpass": "OSM Overpass (najbliższa miejscowość)",
+    "photon": "Photon (komoot)",
+    "uldk": "GUGiK ULDK (obręb ewidencyjny)",
+}
+DEFAULT_PLACE_ORDER = ("nominatim", "overpass", "photon", "uldk")
+OVERPASS_URLS = ("https://overpass-api.de/api/interpreter",
+                 "https://overpass.kumi.systems/api/interpreter")
+PHOTON_URL = "https://photon.komoot.io/reverse"
+ULDK_URL = "https://uldk.gugik.gov.pl/"
+_OVERPASS_PLACES = ("city", "town", "village", "hamlet", "suburb", "isolated_dwelling")
+_MIN_INTERVAL = {"nominatim": 1.1, "overpass": 1.0, "photon": 0.5, "uldk": 0.2}
+
+
+def _norm_name(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip()).casefold()
+
+
+def _haversine(lat1, lon1, lat2, lon2):
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    a = (math.sin((p2 - p1) / 2) ** 2
+         + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lon2 - lon1) / 2) ** 2)
+    return 2 * 6371000 * math.asin(math.sqrt(a))
+
+
+class PlaceResolver:
+    """Ustala miejscowość dla punktu, pytając kolejne źródła.
+
+    * nominatim - adres OSM punktu (village/town/city/hamlet...)
+    * overpass  - najbliższy węzeł place=* z OSM (w promieniu 3 km) + gmina z granic
+    * photon    - niezależny geokoder komoot oparty na danych OSM
+    * uldk      - usługa GUGiK: obręb ewidencyjny działki pod punktem (dane urzędowe)
+
+    Nazwa bierze się z pierwszego źródła, które ją zwróciło. Przy weryfikacji
+    (domyślnie) pytane są wszystkie źródła i rozbieżności trafiają do zestawienia.
+    Źródło, które nie odpowiada (sieć), jest pomijane przy kolejnych stacjach.
+    """
+
+    def __init__(self, cache_dir: Path, order=DEFAULT_PLACE_ORDER,
+                 user_agent: str = DEFAULT_USER_AGENT, verify: bool = True,
+                 majority: bool = False, log=print):
+        for k in order:
+            if k not in PLACE_SOURCE_NAMES:
+                raise ValueError(f"Nieznane źródło nazw '{k}'. Dostępne: {', '.join(PLACE_SOURCE_NAMES)}")
+        if not order:
+            raise ValueError("Pusta lista źródeł nazw miejscowości")
+        self.order = list(order)
         self.user_agent = user_agent
-        self.place_keys = place_keys
-        self._last = 0.0
+        self.verify = verify
+        self.majority = majority
+        self.log = log
+        self.dead: dict[str, str] = {}
+        self._last: dict[str, float] = {}
+        self.cache_path = Path(cache_dir) / "miejscowosci.json"
         try:
             self.cache = json.loads(self.cache_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             self.cache = {}
 
+    # --- infrastruktura -------------------------------------------------------------
     def _save(self):
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        self.cache_path.write_text(json.dumps(self.cache, ensure_ascii=False, indent=1),
-                                   encoding="utf-8")
+        self.cache_path.write_text(json.dumps(self.cache, ensure_ascii=False, indent=1), encoding="utf-8")
 
-    def reverse(self, lat: float, lon: float) -> dict:
-        key = f"{lat:.6f},{lon:.6f}"
-        if key not in self.cache:
-            wait = 1.1 - (time.time() - self._last)
-            if wait > 0:
-                time.sleep(wait)
-            q = urllib.parse.urlencode({"format": "jsonv2", "lat": f"{lat:.7f}",
-                                        "lon": f"{lon:.7f}", "zoom": 18,
-                                        "addressdetails": 1, "accept-language": "pl"})
-            data = _http_get(f"{NOMINATIM_URL}?{q}", self.user_agent)
-            self._last = time.time()
-            self.cache[key] = json.loads(data.decode("utf-8"))
-            self._save()
-        return self.cache[key]
+    def _get(self, key: str, url: str, data: bytes | None = None) -> bytes:
+        wait = _MIN_INTERVAL.get(key, 0) - (time.time() - self._last.get(key, 0))
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            if data is None:
+                return _http_get(url, self.user_agent, timeout=25, retries=2)
+            req = urllib.request.Request(url, data=data, headers={"User-Agent": self.user_agent})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return r.read()
+        finally:
+            self._last[key] = time.time()
 
-    def locality(self, lat: float, lon: float) -> dict:
-        """Zwraca słownik: miejscowosc, gmina, powiat, wojewodztwo, adres."""
-        res = self.reverse(lat, lon)
+    # --- źródła -------------------------------------------------------------------------
+    def _nominatim(self, lat, lon, x, y, zone):
+        q = urllib.parse.urlencode({"format": "jsonv2", "lat": f"{lat:.7f}", "lon": f"{lon:.7f}",
+                                    "zoom": 18, "addressdetails": 1, "accept-language": "pl"})
+        res = json.loads(self._get("nominatim", f"{NOMINATIM_URL}?{q}").decode("utf-8"))
         addr = res.get("address", {}) if isinstance(res, dict) else {}
-        name = next((addr[k] for k in self.place_keys if addr.get(k)), "")
-        gmina = addr.get("municipality", "")
         return {
-            "miejscowosc": name,
-            "gmina": gmina.replace("gmina ", ""),
+            "miejscowosc": next((addr[k] for k in PLACE_KEYS if addr.get(k)), ""),
+            "gmina": addr.get("municipality", "").replace("gmina ", ""),
             "powiat": addr.get("county", "").replace("powiat ", ""),
             "wojewodztwo": addr.get("state", "").replace("województwo ", ""),
-            "adres": res.get("display_name", "") if isinstance(res, dict) else "",
         }
 
+    def _overpass(self, lat, lon, x, y, zone):
+        places = "|".join(_OVERPASS_PLACES)
+        query = (f'[out:json][timeout:25];'
+                 f'node(around:3000,{lat:.7f},{lon:.7f})[place~"^({places})$"][name];out;'
+                 f'is_in({lat:.7f},{lon:.7f})->.a;'
+                 f'area.a[boundary=administrative][admin_level~"^(4|6|7|8)$"];out tags;')
+        body = urllib.parse.urlencode({"data": query}).encode()
+        last = None
+        for url in OVERPASS_URLS:
+            try:
+                res = json.loads(self._get("overpass", url, body).decode("utf-8"))
+                break
+            except Exception as exc:  # noqa: BLE001 - próbujemy lustra
+                last = exc
+        else:
+            raise OsmError(f"Overpass niedostępny: {last}")
+        nodes, admin = [], {}
+        for el in res.get("elements", []):
+            tags = el.get("tags", {})
+            if el.get("type") == "node":
+                nodes.append((_haversine(lat, lon, el["lat"], el["lon"]), tags.get("name:pl") or tags["name"]))
+            elif el.get("type") == "area":
+                admin[tags.get("admin_level")] = tags.get("name", "")
+        name = min(nodes)[1] if nodes else ""
+        return {"miejscowosc": name,
+                "gmina": (admin.get("8") or admin.get("7") or "").replace("gmina ", ""),
+                "powiat": admin.get("6", "").replace("powiat ", ""),
+                "wojewodztwo": admin.get("4", "").replace("województwo ", ""),
+                "odleglosc_m": round(min(nodes)[0]) if nodes else None}
+
+    def _photon(self, lat, lon, x, y, zone):
+        q = urllib.parse.urlencode({"lat": f"{lat:.7f}", "lon": f"{lon:.7f}", "limit": 1})
+        res = json.loads(self._get("photon", f"{PHOTON_URL}?{q}").decode("utf-8"))
+        feats = res.get("features") or []
+        if not feats:
+            return {"miejscowosc": ""}
+        p = feats[0].get("properties", {})
+        name = ""
+        if p.get("osm_key") == "place" and p.get("osm_value") in _OVERPASS_PLACES:
+            name = p.get("name", "")
+        name = name or p.get("city") or p.get("locality") or p.get("district") or ""
+        return {"miejscowosc": name, "powiat": (p.get("county") or "").replace("powiat ", ""),
+                "wojewodztwo": (p.get("state") or "").replace("województwo ", "")}
+
+    def _uldk(self, lat, lon, x, y, zone):
+        # ULDK przyjmuje współrzędne "x,y,srid" w kolejności easting,northing
+        q = urllib.parse.urlencode({"request": "GetParcelByXY",
+                                    "xy": f"{x:.2f},{y:.2f},{epsg_for_zone(zone)}",
+                                    "result": "teryt,voivodeship,county,commune,region"}, safe=",")
+        text = self._get("uldk", f"{ULDK_URL}?{q}").decode("utf-8", "replace").strip()
+        lines = text.splitlines()
+        if not lines or lines[0].strip() != "0" or len(lines) < 2:
+            if lines and lines[0].strip() == "-1":
+                return {"miejscowosc": ""}            # brak działki pod punktem
+            raise OsmError(f"nieoczekiwana odpowiedź ULDK: {text[:120]}")
+        vals = lines[1].split("|")
+        vals += [""] * (5 - len(vals))
+        return {"miejscowosc": vals[4].strip(), "gmina": vals[3].strip(),
+                "powiat": vals[2].strip(), "wojewodztwo": vals[1].strip(), "teryt": vals[0].strip()}
+
+    # --- całość ---------------------------------------------------------------------------
+    def _query(self, key, lat, lon, x, y, zone):
+        ck = f"{key}|{lat:.6f},{lon:.6f}"
+        if ck not in self.cache:
+            self.cache[ck] = getattr(self, f"_{key}")(lat, lon, x, y, zone)
+            self._save()
+        return self.cache[ck]
+
+    def resolve(self, lat, lon, x, y, zone) -> dict:
+        """Zwraca: miejscowosc, gmina, powiat, wojewodztwo, zrodlo, wyniki{źródło: nazwa}, uwagi[]."""
+        results, details, notes = {}, {}, []
+        chosen = None
+        for key in self.order:
+            if key in self.dead:
+                continue
+            if chosen is not None and not self.verify:
+                break
+            try:
+                r = self._query(key, lat, lon, x, y, zone)
+            except Exception as exc:  # noqa: BLE001
+                self.dead[key] = str(exc)
+                rest = [k for k in self.order if k not in self.dead]
+                self.log(f"UWAGA: źródło nazw '{PLACE_SOURCE_NAMES[key]}' nie działa ({exc})"
+                         + (f" - dalej używam: {', '.join(rest)}" if rest else " - brak kolejnych źródeł"))
+                continue
+            details[key] = r
+            if r.get("miejscowosc"):
+                results[key] = r["miejscowosc"]
+                if chosen is None:
+                    chosen = key
+        if self.majority and len(results) >= 3:
+            votes = {}
+            for k, n in results.items():
+                votes.setdefault(_norm_name(n), []).append(k)
+            best = max(votes.values(), key=len)
+            if len(best) > len(votes[_norm_name(results[chosen])]):
+                notes.append(f"nazwa wg większości źródeł ({', '.join(best)}) zamiast {chosen}")
+                chosen = best[0]
+        out = {"miejscowosc": "", "gmina": "", "powiat": "", "wojewodztwo": "", "zrodlo": "",
+               "wyniki": results, "uwagi": notes, "zgodnosc": ""}
+        if chosen is None:
+            return out
+        out.update({k: v for k, v in details[chosen].items() if k in out and v})
+        out["zrodlo"] = PLACE_SOURCE_NAMES[chosen]
+        # brakujące gmina/powiat/województwo uzupełnij z innych źródeł
+        for k in ("gmina", "powiat", "wojewodztwo"):
+            if not out[k]:
+                out[k] = next((d.get(k) for d in details.values() if d.get(k)), "")
+        if self.verify:
+            main = _norm_name(out["miejscowosc"])
+            same = [k for k, n in results.items() if _norm_name(n) == main]
+            diff = {k: n for k, n in results.items() if _norm_name(n) != main}
+            asked = len([k for k in self.order if k in details])
+            if diff:
+                out["zgodnosc"] = f"ROZBIEŻNOŚĆ ({len(same)}/{len(results)})"
+                notes.append("SPRAWDŹ nazwę - inne źródła podają: "
+                             + ", ".join(f"{k}={n}" for k, n in diff.items()))
+            elif len(results) >= 2:
+                out["zgodnosc"] = f"zgodne ({len(same)}/{len(results)})"
+            else:
+                out["zgodnosc"] = f"tylko 1 źródło (odpowiedziało {asked})"
+        return out
+
 
 # ---------------------------------------------------------------------------
-# Podkład rastrowy
+# Podkład rastrowy - kilka źródeł, próbowanych po kolei
 # ---------------------------------------------------------------------------
-class TileSource:
-    def __init__(self, cache_dir: Path, url: str = DEFAULT_TILE_URL,
-                 user_agent: str = DEFAULT_USER_AGENT, tile_size: int = 256,
-                 delay: float = 0.05):
-        self.url = url
-        self.user_agent = user_agent
-        self.tile_size = tile_size
-        self.delay = delay
-        safe = urllib.parse.urlparse(url).netloc.replace(":", "_") or "tiles"
-        self.dir = Path(cache_dir) / "kafle" / safe
-        self.downloaded = 0
+@dataclass
+class BasemapSource:
+    key: str
+    name: str
+    kind: str                   # "xyz" (kafle Web Mercator) albo "wms" (obraz od razu w PL-2000)
+    url: str
+    attribution: str
+    max_zoom: int = 19
+    subdomains: str = ""
+    layers: str = ""            # tylko WMS
+    image_format: str = "image/png"
+    max_size: int = 2048        # WMS: maks. wymiar jednego zapytania w pikselach
 
-    def tile_bytes(self, z: int, x: int, y: int) -> bytes:
-        path = self.dir / str(z) / str(x) / f"{y}.png"
-        if path.exists() and path.stat().st_size > 0:
-            return path.read_bytes()
-        url = self.url.format(z=z, x=x, y=y, s="abc"[(x + y) % 3])
-        data = _http_get(url, self.user_agent)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_bytes(data)
-        os.replace(tmp, path)
-        self.downloaded += 1
-        time.sleep(self.delay)
-        return data
+
+BASEMAP_SOURCES = {s.key: s for s in (
+    BasemapSource("osm", "OpenStreetMap (tile.openstreetmap.org)", "xyz",
+                  "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+                  "Podkład mapowy: © autorzy OpenStreetMap (openstreetmap.org/copyright)", 19),
+    BasemapSource("osm-de", "OpenStreetMap Niemcy (tile.openstreetmap.de)", "xyz",
+                  "https://tile.openstreetmap.de/{z}/{x}/{y}.png",
+                  "Podkład mapowy: © autorzy OpenStreetMap (openstreetmap.org/copyright)", 19),
+    BasemapSource("osm-fr", "OpenStreetMap Francja (tile.openstreetmap.fr)", "xyz",
+                  "https://{s}.tile.openstreetmap.fr/osmfr/{z}/{x}/{y}.png",
+                  "Podkład mapowy: © autorzy OpenStreetMap (openstreetmap.org/copyright), kafle OSM France",
+                  19, "abc"),
+    BasemapSource("carto", "CARTO Voyager (dane OSM)", "xyz",
+                  "https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png",
+                  "Podkład mapowy: © autorzy OpenStreetMap, © CARTO", 20, "abcd"),
+    BasemapSource("opentopomap", "OpenTopoMap (dane OSM)", "xyz",
+                  "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
+                  "Podkład mapowy: © autorzy OpenStreetMap, SRTM | styl: © OpenTopoMap (CC-BY-SA)",
+                  17, "abc"),
+    BasemapSource("esri", "Esri World Street Map", "xyz",
+                  "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}",
+                  "Podkład mapowy: Esri World Street Map (© Esri i dostawcy danych)", 19),
+    BasemapSource("geoportal-orto", "Geoportal.gov.pl - ortofotomapa (WMS)", "wms",
+                  "https://mapy.geoportal.gov.pl/wss/service/PZGIK/ORTO/WMS/StandardResolution",
+                  "Podkład mapowy: ortofotomapa © GUGiK (geoportal.gov.pl)",
+                  layers="Raster", image_format="image/jpeg"),
+)}
+DEFAULT_SOURCE_ORDER = ("osm", "osm-de", "osm-fr", "carto", "opentopomap", "esri", "geoportal-orto")
+
+_IMAGE_MAGIC = (b"\x89PNG", b"\xff\xd8\xff", b"GIF8", b"RIFF", b"II*\x00", b"MM\x00*")
+
+
+def _check_image(data: bytes, url: str) -> bytes:
+    if not data.startswith(_IMAGE_MAGIC):
+        snippet = data[:150].decode("utf-8", "replace").replace("\n", " ")
+        raise OsmError(f"serwer zwrócił coś innego niż obraz ({url}): {snippet}")
+    return data
 
 
 def _require_pillow():
@@ -622,75 +820,180 @@ def _require_pillow():
         raise OsmError("Do pobierania podkładu potrzebny jest Pillow: pip install pillow") from exc
 
 
-def render_basemap(bbox, zone: int, out_png: Path, tiles: TileSource,
-                   zoom: int = 16, resolution: float = 1.0, mesh_step: int = 64):
-    """Tworzy podkład OSM w układzie PL-2000 dla prostokąta bbox=(xmin,ymin,xmax,ymax).
+class BasemapProvider:
+    """Pobiera podkład z pierwszego działającego źródła z listy.
 
-    Kafle (Web Mercator) są sklejane i przeliczane (siatka MESH Pillow) do
-    regularnej siatki PL-2000, więc obraz można wstawić do DXF bez obrotu.
-    Zapisuje PNG + plik georeferencji .pgw. Zwraca słownik z parametrami obrazu.
+    Źródło, które zawiedzie, jest pomijane przy kolejnych arkuszach (żeby nie
+    czekać za każdym razem na limity czasu). Jeden arkusz zawsze pochodzi
+    z jednego źródła - kafle różnych serwerów nie są mieszane.
     """
-    _require_pillow()
-    from PIL import Image
 
-    xmin, ymin, xmax, ymax = bbox
-    width = max(1, int(math.ceil((xmax - xmin) / resolution)))
-    height = max(1, int(math.ceil((ymax - ymin) / resolution)))
-    xmax, ymin = xmin + width * resolution, ymax - height * resolution
+    def __init__(self, cache_dir: Path, sources, user_agent: str = DEFAULT_USER_AGENT,
+                 delay: float = 0.05, log=print):
+        self.cache_dir = Path(cache_dir)
+        self.sources = list(sources)
+        if not self.sources:
+            raise ValueError("Pusta lista źródeł podkładu")
+        self.user_agent = user_agent
+        self.delay = delay
+        self.log = log
+        self.dead: dict[str, str] = {}          # klucz źródła -> powód
+        self.downloaded: dict[str, int] = {}
 
-    def to_px(px, py):
-        lat, lon = pl2000_to_wgs84(xmin + px * resolution, ymax - py * resolution, zone)
-        return wgs84_to_tile_px(lat, lon, zoom, tiles.tile_size)
+    # --- pobieranie z cache ------------------------------------------------------
+    def _cached(self, src: BasemapSource, rel: str, url: str) -> bytes:
+        path = self.cache_dir / "kafle" / src.key / rel
+        if path.exists() and path.stat().st_size > 0:
+            return path.read_bytes()
+        data = _check_image(_http_get(url, self.user_agent, timeout=20, retries=2), url)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+        self.downloaded[src.key] = self.downloaded.get(src.key, 0) + 1
+        time.sleep(self.delay)
+        return data
 
-    # zakres kafli
-    corners = [to_px(px, py) for px in (0, width) for py in (0, height)]
-    gx = [c[0] for c in corners]
-    gy = [c[1] for c in corners]
-    ts = tiles.tile_size
-    tx0, tx1 = int(min(gx) // ts), int(max(gx) // ts)
-    ty0, ty1 = int(min(gy) // ts), int(max(gy) // ts)
-    n_tiles = (tx1 - tx0 + 1) * (ty1 - ty0 + 1)
-    if n_tiles > 2500:
-        raise OsmError(f"Za dużo kafli ({n_tiles}) - zmniejsz poziom zoom")
+    def _tile(self, src: BasemapSource, z: int, x: int, y: int) -> bytes:
+        s = src.subdomains[(x + y) % len(src.subdomains)] if src.subdomains else ""
+        url = src.url.format(z=z, x=x, y=y, s=s)
+        return self._cached(src, f"{z}/{x}/{y}.img", url)
 
-    mosaic = Image.new("RGB", ((tx1 - tx0 + 1) * ts, (ty1 - ty0 + 1) * ts), "white")
-    for tx in range(tx0, tx1 + 1):
-        for ty in range(ty0, ty1 + 1):
-            with Image.open(io.BytesIO(tiles.tile_bytes(zoom, tx, ty))) as im:
-                mosaic.paste(im.convert("RGB"), ((tx - tx0) * ts, (ty - ty0) * ts))
-    ox, oy = tx0 * ts, ty0 * ts
+    # --- XYZ: sklejenie kafli i przeliczenie do PL-2000 ------------------------------
+    def _render_xyz(self, src, bbox, zone, width, height, resolution, zoom, mesh_step=64):
+        from PIL import Image
+        zoom = min(zoom, src.max_zoom)
+        xmin, ymax = bbox[0], bbox[3]
+        ts = 256
 
-    # siatka transformacji: prostokąt wynikowy -> czworokąt w mozaice
-    cache = {}
+        def to_px(px, py):
+            lat, lon = pl2000_to_wgs84(xmin + px * resolution, ymax - py * resolution, zone)
+            return wgs84_to_tile_px(lat, lon, zoom, ts)
 
-    def src(px, py):
-        if (px, py) not in cache:
-            x, y = to_px(px, py)
-            cache[(px, py)] = (x - ox, y - oy)
-        return cache[(px, py)]
+        corners = [to_px(px, py) for px in (0, width) for py in (0, height)]
+        gx = [c[0] for c in corners]
+        gy = [c[1] for c in corners]
+        tx0, tx1 = int(min(gx) // ts), int(max(gx) // ts)
+        ty0, ty1 = int(min(gy) // ts), int(max(gy) // ts)
+        n_tiles = (tx1 - tx0 + 1) * (ty1 - ty0 + 1)
+        if n_tiles > 2500:
+            raise OsmError(f"za dużo kafli ({n_tiles}) - zmniejsz --zoom")
 
-    mesh = []
-    for y0 in range(0, height, mesh_step):
-        y1 = min(height, y0 + mesh_step)
-        for x0 in range(0, width, mesh_step):
-            x1 = min(width, x0 + mesh_step)
-            quad = (*src(x0, y0), *src(x0, y1), *src(x1, y1), *src(x1, y0))
-            mesh.append(((x0, y0, x1, y1), quad))
+        mosaic = Image.new("RGB", ((tx1 - tx0 + 1) * ts, (ty1 - ty0 + 1) * ts), "white")
+        for tx in range(tx0, tx1 + 1):
+            for ty in range(ty0, ty1 + 1):
+                with Image.open(io.BytesIO(self._tile(src, zoom, tx, ty))) as im:
+                    im = im.convert("RGB")
+                    if im.size != (ts, ts):
+                        im = im.resize((ts, ts))
+                    mosaic.paste(im, ((tx - tx0) * ts, (ty - ty0) * ts))
+        ox, oy = tx0 * ts, ty0 * ts
+        cache = {}
 
-    # Pillow >= 9.1 ma enumy Image.Transform / Image.Resampling, starsze - stałe modułu
-    mesh_mode = getattr(Image, "Transform", Image).MESH
-    resample = getattr(Image, "Resampling", Image).BICUBIC
-    out = mosaic.transform((width, height), mesh_mode, mesh, resample=resample,
-                           fillcolor="white")
-    out_png = Path(out_png)
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-    out.save(out_png, optimize=True)
-    # world file: środek lewego górnego piksela
-    out_png.with_suffix(".pgw").write_text(
-        "\n".join(f"{v:.10f}" for v in (resolution, 0.0, 0.0, -resolution,
-                                         xmin + resolution / 2, ymax - resolution / 2)) + "\n")
-    return {"path": out_png, "width": width, "height": height,
-            "xmin": xmin, "ymin": ymin, "resolution": resolution, "tiles": n_tiles}
+        def srcpt(px, py):
+            if (px, py) not in cache:
+                x, y = to_px(px, py)
+                cache[(px, py)] = (x - ox, y - oy)
+            return cache[(px, py)]
+
+        mesh = []
+        for y0 in range(0, height, mesh_step):
+            y1 = min(height, y0 + mesh_step)
+            for x0 in range(0, width, mesh_step):
+                x1 = min(width, x0 + mesh_step)
+                quad = (*srcpt(x0, y0), *srcpt(x0, y1), *srcpt(x1, y1), *srcpt(x1, y0))
+                mesh.append(((x0, y0, x1, y1), quad))
+        # Pillow >= 9.1 ma enumy Image.Transform / Image.Resampling, starsze - stałe modułu
+        mesh_mode = getattr(Image, "Transform", Image).MESH
+        resample = getattr(Image, "Resampling", Image).BICUBIC
+        return mosaic.transform((width, height), mesh_mode, mesh, resample=resample,
+                                fillcolor="white"), n_tiles
+
+    # --- WMS: obraz od razu w PL-2000, w kawałkach -----------------------------------
+    def _render_wms(self, src, bbox, zone, width, height, resolution):
+        from PIL import Image
+        import hashlib
+        xmin, ymax = bbox[0], bbox[3]
+        out = Image.new("RGB", (width, height), "white")
+        step = src.max_size
+        n = 0
+        for py0 in range(0, height, step):
+            ph = min(step, height - py0)
+            for px0 in range(0, width, step):
+                pw = min(step, width - px0)
+                bx0 = xmin + px0 * resolution
+                by1 = ymax - py0 * resolution
+                bb = (bx0, by1 - ph * resolution, bx0 + pw * resolution, by1)
+                q = urllib.parse.urlencode({
+                    "SERVICE": "WMS", "VERSION": "1.1.1", "REQUEST": "GetMap",
+                    "LAYERS": src.layers, "STYLES": "", "SRS": f"EPSG:{epsg_for_zone(zone)}",
+                    "BBOX": ",".join(f"{v:.3f}" for v in bb), "WIDTH": pw, "HEIGHT": ph,
+                    "FORMAT": src.image_format, "BGCOLOR": "0xFFFFFF"})
+                url = f"{src.url}?{q}"
+                key = hashlib.sha1(url.encode()).hexdigest()
+                with Image.open(io.BytesIO(self._cached(src, f"wms/{key}.img", url))) as im:
+                    im = im.convert("RGB")
+                    if im.size != (pw, ph):
+                        im = im.resize((pw, ph))
+                    out.paste(im, (px0, py0))
+                n += 1
+        return out, n
+
+    # --- całość ------------------------------------------------------------------------
+    def render(self, bbox, zone: int, out_png: Path, zoom: int = 16, resolution: float = 1.0):
+        """Tworzy podkład dla prostokąta bbox=(xmin,ymin,xmax,ymax) w PL-2000.
+
+        Zapisuje PNG + plik georeferencji .pgw i zwraca słownik z parametrami
+        obrazu oraz użytym źródłem. Gdy żadne źródło nie działa - OsmError.
+        """
+        _require_pillow()
+        xmin, ymin, xmax, ymax = bbox
+        width = max(1, int(math.ceil((xmax - xmin) / resolution)))
+        height = max(1, int(math.ceil((ymax - ymin) / resolution)))
+        bbox = (xmin, ymax - height * resolution, xmin + width * resolution, ymax)
+        errors = []
+        for src in self.sources:
+            if src.key in self.dead:
+                continue
+            try:
+                if src.kind == "wms":
+                    img, n = self._render_wms(src, bbox, zone, width, height, resolution)
+                else:
+                    img, n = self._render_xyz(src, bbox, zone, width, height, resolution, zoom)
+            except Exception as exc:  # noqa: BLE001 - każde niepowodzenie = następne źródło
+                self.dead[src.key] = str(exc)
+                errors.append(f"{src.key}: {exc}")
+                rest = [s.key for s in self.sources if s.key not in self.dead]
+                self.log(f"UWAGA: źródło podkładu '{src.name}' nie działa ({exc}). "
+                         + (f"Próbuję następnego: {rest[0]}" if rest else "Brak kolejnych źródeł."))
+                continue
+            out_png = Path(out_png)
+            out_png.parent.mkdir(parents=True, exist_ok=True)
+            img.save(out_png, optimize=True)
+            out_png.with_suffix(".pgw").write_text(            # środek lewego górnego piksela
+                "\n".join(f"{v:.10f}" for v in (resolution, 0.0, 0.0, -resolution,
+                                                 bbox[0] + resolution / 2, bbox[3] - resolution / 2)) + "\n")
+            return {"path": out_png, "width": width, "height": height, "xmin": bbox[0], "ymin": bbox[1],
+                    "resolution": resolution, "requests": n, "source": src}
+        raise OsmError("żadne źródło podkładu nie zadziałało"
+                       + (": " + " | ".join(errors) if errors else " (wszystkie wcześniej zawiodły)"))
+
+
+def resolve_sources(keys, custom_url: str | None = None):
+    """Lista źródeł wg kluczy (z ewentualnym własnym serwerem kafli na początku)."""
+    out = []
+    if custom_url:
+        out.append(BasemapSource("wlasny", f"własny serwer ({urllib.parse.urlparse(custom_url).netloc})",
+                                 "xyz", custom_url, "Podkład mapowy: © autorzy OpenStreetMap", 19,
+                                 "abc" if "{s}" in custom_url else ""))
+    for k in keys:
+        k = k.strip().lower()
+        if not k:
+            continue
+        if k not in BASEMAP_SOURCES:
+            raise ValueError(f"Nieznane źródło podkładu '{k}'. Dostępne: {', '.join(BASEMAP_SOURCES)}")
+        out.append(BASEMAP_SOURCES[k])
+    return out
 
 
 # ============================================================================
@@ -700,7 +1003,6 @@ LABEL_RE = re.compile(r"STACJA\s+TRAFO\s*(\d+)\s*-\s*(\d+)", re.IGNORECASE)
 SCALE_TEXT_RE = re.compile(r"^\s*1\s*:\s*[\d\s.]+$")
 STANDARD_SCALES = (500, 1000, 2000, 2500, 5000, 10000, 15000, 20000, 25000, 50000, 100000)
 UNKNOWN_PLACE = "????"
-OSM_ATTRIBUTION = "Podkład mapowy: © autorzy OpenStreetMap (openstreetmap.org/copyright)"
 
 
 # ---------------------------------------------------------------------------
@@ -755,9 +1057,12 @@ class Station:
     # wyniki
     place: dict = field(default_factory=dict)
     place_source: str = ""
+    place_check: str = ""
+    place_others: str = ""
     scale: int = 0
     dxf_name: str = ""
     basemap_name: str = ""
+    basemap_source: str = ""
     notes: list = field(default_factory=list)
 
     @property
@@ -931,8 +1236,12 @@ class Options:
     resolution: float = 1.0
     basemap_margin: float = 0.15
     tile_url: str | None = None
+    basemap_sources: tuple = DEFAULT_SOURCE_ORDER
     user_agent: str | None = None
     geocode: bool = True
+    place_sources: tuple = DEFAULT_PLACE_ORDER
+    verify_places: bool = True
+    majority_place: bool = False
     names_csv: Path | None = None
     only: set | None = None
     keep_other_stations: bool = False
@@ -975,17 +1284,20 @@ class Generator:
         self.zone = pl2000_zone_from_easting(x0)
         self._detect_table_texts()
         self.names = load_names_csv(opt.names_csv) if opt.names_csv else {}
-        self.geocoder = self.tiles = None
+        self.geocoder = self.basemap = None
         if opt.geocode:
-            self.geocoder = Geocoder(opt.cache_dir, opt.user_agent or DEFAULT_USER_AGENT)
+            self.geocoder = PlaceResolver(opt.cache_dir, [k.strip().lower() for k in opt.place_sources if k.strip()],
+                                          opt.user_agent or DEFAULT_USER_AGENT, opt.verify_places,
+                                          opt.majority_place, log=log)
         if opt.basemap:
             try:
                 import PIL  # noqa: F401
             except ImportError:
                 raise ValueError("Do pobierania podkładu OSM potrzebna jest biblioteka Pillow: "
                                  "pip install pillow  (albo uruchom z opcją --bez-podkladu)") from None
-            self.tiles = TileSource(opt.cache_dir, opt.tile_url or DEFAULT_TILE_URL,
-                                    opt.user_agent or DEFAULT_USER_AGENT)
+            self.basemap = BasemapProvider(opt.cache_dir,
+                                           resolve_sources(opt.basemap_sources, opt.tile_url),
+                                           opt.user_agent or DEFAULT_USER_AGENT, log=log)
 
     # --- analiza szablonu ----------------------------------------------------
     def _table_entities(self, doc):
@@ -1025,16 +1337,21 @@ class Generator:
         st.place = {"lat": lat, "lon": lon, "miejscowosc": "", "gmina": "", "powiat": "",
                     "wojewodztwo": ""}
         if self.geocoder:
-            try:
-                st.place.update(self.geocoder.locality(lat, lon))
-                st.place_source = "OSM Nominatim"
-            except Exception as exc:  # noqa: BLE001
-                st.notes.append(f"geokodowanie nieudane: {exc}")
-                self.log(f"UWAGA: Nominatim niedostępny ({exc}) - pomijam geokodowanie kolejnych stacji")
-                self.geocoder = None
+            r = self.geocoder.resolve(lat, lon, st.x, st.y, self.zone)
+            for k in ("miejscowosc", "gmina", "powiat", "wojewodztwo"):
+                st.place[k] = r[k]
+            st.place_source = r["zrodlo"]
+            st.place_check = r["zgodnosc"]
+            st.place_others = ", ".join(f"{k}: {n}" for k, n in r["wyniki"].items())
+            st.notes.extend(r["uwagi"])
+            if not r["wyniki"] and not self.geocoder.dead:
+                st.notes.append("żadne źródło nie zwróciło nazwy miejscowości")
         if st.nr in self.names:
+            auto = st.place["miejscowosc"]
             st.place["miejscowosc"] = self.names[st.nr]
             st.place_source = "plik nazw"
+            if auto and _norm_name(auto) != _norm_name(self.names[st.nr]):
+                st.notes.append(f"plik nazw: {self.names[st.nr]}, źródła automatyczne: {auto}")
         if not st.place["miejscowosc"]:
             st.place["miejscowosc"] = UNKNOWN_PLACE
             st.place_source = "BRAK"
@@ -1087,7 +1404,7 @@ class Generator:
         if not st.dxf_name.lower().endswith(".dxf"):
             st.dxf_name += ".dxf"
         if self.image is not None:
-            if self.tiles is not None:
+            if self.basemap is not None:
                 self._apply_basemap(doc, st, cx, cy)
             else:
                 self._relink_template_image(doc)
@@ -1100,14 +1417,15 @@ class Generator:
         bbox = (cx - w * k / 2, cy - h * k / 2, cx + w * k / 2, cy + h * k / 2)
         png = opt.out_dir / f"{Path(st.dxf_name).stem}_podklad.png"
         try:
-            info = render_basemap(bbox, self.zone, png, self.tiles, opt.zoom, opt.resolution)
+            info = self.basemap.render(bbox, self.zone, png, opt.zoom, opt.resolution)
         except Exception as exc:  # noqa: BLE001
-            st.notes.append(f"podkład OSM nieudany: {exc} - zostawiono obraz z szablonu")
-            self.log(f"UWAGA: nie udało się pobrać podkładu ({exc}) - kolejne arkusze bez podkładu OSM")
-            self.tiles = None
+            st.notes.append(f"podkład nieudany ({exc}) - zostawiono obraz z szablonu")
             self._relink_template_image(doc)
             return
         st.basemap_name = png.name
+        st.basemap_source = info["source"].name
+        if info["source"].key != self.basemap.sources[0].key:
+            st.notes.append(f"podkład z zapasowego źródła: {info['source'].name}")
         img = doc.by_handle[self.image.handle.upper()]
         res = info["resolution"]
         img.set(10, info["xmin"])
@@ -1129,9 +1447,9 @@ class Generator:
             idef.set(1, png.name)
             idef.set(10, float(info["width"]))
             idef.set(20, float(info["height"]))
-        self._add_attribution(doc)
+        self._add_attribution(doc, info["source"].attribution)
 
-    def _add_attribution(self, doc):
+    def _add_attribution(self, doc, text: str):
         if not self.scale_texts:
             return
         anchor = doc.by_handle[self.scale_texts[0].handle.upper()]
@@ -1142,7 +1460,7 @@ class Generator:
             (0, "MTEXT"), (5, doc.new_handle()), (330, anchor.get(330)), (100, "AcDbEntity"),
             (67, "     1"), (8, anchor.layer or "0"), (100, "AcDbMText"),
             (10, fmt_float(x)), (20, fmt_float(y)), (30, "0.0"), (40, "1.5"), (41, "0.0"),
-            (71, "     7"), (72, "     1"), (1, OSM_ATTRIBUTION), (73, "     1"), (44, "1.0"),
+            (71, "     7"), (72, "     1"), (1, text), (73, "     1"), (44, "1.0"),
             (90, "        3"), (63, "   256"), (45, "1.2"), (441, "        0"),
         ])
 
@@ -1169,33 +1487,40 @@ class Generator:
         for st in todo:
             self.resolve_place(st)
             self.build_sheet(st)
-            extra = f", podkład {st.basemap_name}" if st.basemap_name else ""
+            extra = f", podkład {st.basemap_name} ({st.basemap_source})" if st.basemap_name else ""
             self.log(f"  {st.designation:>8}  {st.place['miejscowosc']:<20} 1:{st.scale:<6} -> "
                      f"{st.dxf_name}{extra}" + (f"   [{'; '.join(st.notes)}]" if st.notes else ""))
         self.write_excel(todo)
-        if self.tiles is not None:
-            self.log(f"Pobrano nowych kafli OSM: {self.tiles.downloaded}")
+        if self.basemap is not None:
+            got = ", ".join(f"{k}: {v}" for k, v in self.basemap.downloaded.items()) or "0 (wszystko z cache)"
+            self.log(f"Pobrane fragmenty podkładu: {got}")
+            for k, why in self.basemap.dead.items():
+                self.log(f"  niedziałające źródło {k}: {why}")
         self.log(f"Zestawienie: {opt.excel}")
         return todo
 
     def write_excel(self, stations):
         cols = [("Lp.", 5, "int"), ("Oznaczenie stacji", 12, None), ("Nr stacji", 9, "int"),
                 ("Miejscowość", 20, None), ("Gmina", 16, None), ("Powiat", 16, None),
-                ("Województwo", 16, None), ("Źródło nazwy", 15, None),
+                ("Województwo", 16, None), ("Źródło nazwy", 22, None),
+                ("Weryfikacja nazwy", 20, None), ("Nazwy ze wszystkich źródeł", 45, None),
                 ("X PL-2000 [m] (północ)", 15, "2"), ("Y PL-2000 [m] (wschód)", 15, "2"),
                 ("Szerokość geogr. [°]", 13, "6"), ("Długość geogr. [°]", 13, "6"),
                 ("Obrys zasięgu w szablonie", 12, None),
                 ("Skala arkusza", 10, None), ("Plik DXF", 16, None), ("Podkład mapowy", 22, None),
+                ("Źródło podkładu", 30, None),
                 ("Uwagi", 60, None)]
         rows = []
         for i, st in enumerate(stations, start=1):
             p = st.place
             rows.append([i, st.designation, st.nr, p.get("miejscowosc", ""), p.get("gmina", ""),
                          p.get("powiat", ""), p.get("wojewodztwo", ""), st.place_source,
+                         st.place_check, st.place_others,
                          round(st.y, 2), round(st.x, 2), round(p["lat"], 6), round(p["lon"], 6),
                          "tak" if st.zone_pts else "nie",
                          format_scale(st.scale), st.dxf_name,
                          st.basemap_name or ("szablon" if self.image is not None else ""),
+                         st.basemap_source,
                          "; ".join(st.notes)])
         self.opt.excel.parent.mkdir(parents=True, exist_ok=True)
         write_xlsx(self.opt.excel, "Stacje trafo", cols, rows)
@@ -1221,17 +1546,28 @@ def parse_args(argv=None):
                    help="nie usuwaj odnośników i obrysów pozostałych stacji")
 
     g = p.add_argument_group("nazwy miejscowości")
-    g.add_argument("--bez-geokodowania", action="store_true", help="nie pytaj OSM Nominatim o nazwy")
+    g.add_argument("--bez-geokodowania", action="store_true", help="nie pytaj żadnych serwisów o nazwy")
+    g.add_argument("--zrodla-nazw", default=",".join(DEFAULT_PLACE_ORDER),
+                   help="kolejność źródeł nazw miejscowości (domyślnie: "
+                        f"{','.join(DEFAULT_PLACE_ORDER)}); nazwa z pierwszego, które odpowie")
+    g.add_argument("--bez-weryfikacji-nazw", action="store_true",
+                   help="nie pytaj pozostałych źródeł dla porównania (szybciej)")
+    g.add_argument("--nazwa-wg-wiekszosci", action="store_true",
+                   help="gdy źródła się różnią, weź nazwę podaną przez większość (min. 3 źródła)")
     g.add_argument("--nazwy", type=Path, help="CSV 'numer;miejscowość' - nadpisuje nazwy z OSM")
 
-    g = p.add_argument_group("podkład mapowy OpenStreetMap")
+    g = p.add_argument_group("podkład mapowy")
     g.add_argument("--bez-podkladu", action="store_true",
-                   help="nie pobieraj podkładu OSM (zostaje obraz z szablonu)")
+                   help="nie pobieraj podkładu (zostaje obraz z szablonu)")
+    g.add_argument("--zrodla-podkladu", default=",".join(DEFAULT_SOURCE_ORDER),
+                   help="kolejność źródeł podkładu, próbowanych gdy poprzednie zawiedzie "
+                        f"(domyślnie: {','.join(DEFAULT_SOURCE_ORDER)})")
+    g.add_argument("--lista-zrodel", action="store_true", help="pokaż dostępne źródła podkładu i nazw, i zakończ")
     g.add_argument("--zoom", type=int, default=16, help="poziom kafli OSM (domyślnie 16, max 19)")
     g.add_argument("--rozdzielczosc", type=float, default=1.0, help="rozmiar piksela podkładu w m (domyślnie 1.0)")
     g.add_argument("--margines-podkladu", type=float, default=0.15,
                    help="zapas podkładu poza rzutnią, ułamek wymiaru (domyślnie 0.15)")
-    g.add_argument("--serwer-kafli", help="URL kafli {z}/{x}/{y} (domyślnie tile.openstreetmap.org)")
+    g.add_argument("--serwer-kafli", help="własny serwer kafli {z}/{x}/{y} - próbowany jako pierwszy")
     g.add_argument("--user-agent", help="User-Agent dla serwerów OSM (najlepiej z adresem e-mail)")
 
     g = p.add_argument_group("budowa szablonu")
@@ -1252,6 +1588,14 @@ def main(argv=None) -> int:
         except AttributeError:
             pass
     a = parse_args(argv)
+    if a.lista_zrodel:
+        print("Źródła podkładu (--zrodla-podkladu):")
+        for src in BASEMAP_SOURCES.values():
+            print(f"  {src.key:<15} {src.name}  [{src.kind}, {src.url}]")
+        print("Źródła nazw miejscowości (--zrodla-nazw):")
+        for k, n in PLACE_SOURCE_NAMES.items():
+            print(f"  {k:<15} {n}")
+        return 0
     only = None
     if a.stacje:
         only = set()
@@ -1263,7 +1607,9 @@ def main(argv=None) -> int:
         template=a.szablon, out_dir=a.wyniki, excel=a.excel or a.wyniki / "zestawienie_stacji.xlsx",
         cache_dir=a.cache, scale=a.skala, fixed_scale=a.stala_skala, basemap=not a.bez_podkladu,
         zoom=a.zoom, resolution=a.rozdzielczosc, basemap_margin=a.margines_podkladu,
-        tile_url=a.serwer_kafli, user_agent=a.user_agent, geocode=not a.bez_geokodowania,
+        tile_url=a.serwer_kafli, basemap_sources=tuple(a.zrodla_podkladu.split(",")), user_agent=a.user_agent, geocode=not a.bez_geokodowania,
+        place_sources=tuple(a.zrodla_nazw.split(",")), verify_places=not a.bez_weryfikacji_nazw,
+        majority_place=a.nazwa_wg_wiekszosci,
         names_csv=a.nazwy, only=only, keep_other_stations=a.zostaw_inne_stacje,
         zone_layer=a.warstwa_obrysow, table_block=a.blok_tabelki,
         place_phrase=a.fraza_miejscowosci, station_placeholder=a.znacznik_stacji,
