@@ -1840,7 +1840,7 @@ def test_sources(opt) -> int:
             print(f"  [BŁĄD] {key:<15} {exc}")
     try:
         import PIL
-        print(f"\nPillow: {PIL.__version__}")
+        print(f"\nPillow: {getattr(PIL, '__version__', '?')}")
     except ImportError:
         print("\nPillow: BRAK - zainstaluj: pip install pillow")
         return 0
