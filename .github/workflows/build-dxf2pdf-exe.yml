@@ -1,0 +1,90 @@
+name: Buduj DXF2PDF.exe (Windows)
+
+on:
+  push:
+    branches: [main, pdf-z-dxf, dxf2pdf-mniejszy-pdf]
+    tags: ["dxf2pdf-v*"]
+    paths:
+      - "narzedzia/dxf2pdf.py"
+      - ".github/workflows/build-dxf2pdf-exe.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      PYTHONIOENCODING: "utf-8"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalacja
+        run: python -m pip install --upgrade pip pyinstaller ezdxf pymupdf pillow
+
+      - name: Budowanie DXF2PDF.exe
+        run: pyinstaller --onefile --windowed --name DXF2PDF --collect-all ezdxf narzedzia/dxf2pdf.py
+
+      - name: Test skryptu (bez exe) - 541.dxf
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force test_py_wej | Out-Null
+          Copy-Item 541.dxf, orientacja.png test_py_wej\
+          Measure-Command { python narzedzia/dxf2pdf.py test_py_wej test_py | Out-Host }
+          if (-not (Test-Path test_py\541.pdf)) { exit 1 }
+
+      - name: Test exe - wszystkie DXF z repo do osobnego folderu
+        timeout-minutes: 20
+        shell: pwsh
+        run: |
+          $p = Start-Process dist\DXF2PDF.exe -ArgumentList '"."', '"test_pdf"' -PassThru
+          if (-not $p.WaitForExit(15 * 60 * 1000)) { Write-Host "Exe nie skonczyl w 15 min"; $p.Kill() }
+          if (Test-Path test_pdf\dxf2pdf_log.txt) { Get-Content test_pdf\dxf2pdf_log.txt }
+          Write-Host "Kod wyjscia: $($p.ExitCode)"
+          Get-ChildItem test_pdf | Format-Table Name, @{n='MB';e={[math]::Round($_.Length/1MB,2)}}
+          $dxf = (Get-ChildItem . -Filter *.dxf).Count
+          $pdf = (Get-ChildItem test_pdf -Filter *.pdf).Count
+          Write-Host "DXF: $dxf, PDF: $pdf"
+          if ($p.ExitCode -ne 0 -or $pdf -ne $dxf) { exit 1 }
+
+      - name: Test - zawartosc PDF (strony, JPG, rozmiar) + podglad PNG
+        shell: python
+        run: |
+          import pathlib, pymupdf
+          podglad = pathlib.Path("test_pdf/podglad"); podglad.mkdir()
+          for f in sorted(pathlib.Path("test_pdf").glob("*.pdf")):
+              d = pymupdf.open(f)
+              obrazy = {i[0]: i for s in d for i in s.get_images(full=True)}
+              filtry = sorted({i[8] for i in obrazy.values() if i[4] != 1})
+              mb = f.stat().st_size / 1e6
+              print(f"{f.name}: {d.page_count} str., {mb:.2f} MB, obrazy: {[(i[2], i[3], i[8]) for i in obrazy.values()]}")
+              assert d.page_count >= 1, "brak stron"
+              assert all(x == "DCTDecode" for x in filtry), f"obraz nie jest JPG: {filtry}"
+              assert mb < 5, "PDF za duzy"
+              d[0].get_pixmap(dpi=60).save(podglad / f"{f.stem}_str1.png")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DXF2PDF
+          path: dist/DXF2PDF.exe
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wyniki-testow
+          path: test_pdf/
+
+      - name: Wydanie (release) dla tagu
+        if: startsWith(github.ref, 'refs/tags/dxf2pdf-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/DXF2PDF.exe
+          body: |
+            DXF2PDF.exe - kazdy plik DXF z wybranego folderu -> jeden PDF (arkusze jako strony).
+            Uruchom dwuklikiem, wybierz folder z DXF i folder na PDF, kliknij "Konwertuj".
