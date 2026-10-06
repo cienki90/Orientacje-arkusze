@@ -30,10 +30,22 @@ jobs:
       - name: Budowanie DXF2PDF.exe
         run: pyinstaller --onefile --windowed --name DXF2PDF --collect-all ezdxf narzedzia/dxf2pdf.py
 
-      - name: Test - wszystkie DXF z repo do osobnego folderu
+      - name: Test skryptu (bez exe) - 541.dxf
+        timeout-minutes: 10
         shell: pwsh
         run: |
-          $p = Start-Process dist\DXF2PDF.exe -ArgumentList '"."', '"test_pdf"' -Wait -PassThru
+          New-Item -ItemType Directory -Force test_py_wej | Out-Null
+          Copy-Item 541.dxf, orientacja.png test_py_wej\
+          Measure-Command { python narzedzia/dxf2pdf.py test_py_wej test_py | Out-Host }
+          if (-not (Test-Path test_py\541.pdf)) { exit 1 }
+
+      - name: Test exe - wszystkie DXF z repo do osobnego folderu
+        timeout-minutes: 20
+        shell: pwsh
+        run: |
+          $p = Start-Process dist\DXF2PDF.exe -ArgumentList '"."', '"test_pdf"' -PassThru
+          if (-not $p.WaitForExit(15 * 60 * 1000)) { Write-Host "Exe nie skonczyl w 15 min"; $p.Kill() }
+          if (Test-Path test_pdf\dxf2pdf_log.txt) { Get-Content test_pdf\dxf2pdf_log.txt }
           Write-Host "Kod wyjscia: $($p.ExitCode)"
           Get-ChildItem test_pdf | Format-Table Name, @{n='MB';e={[math]::Round($_.Length/1MB,2)}}
           $dxf = (Get-ChildItem . -Filter *.dxf).Count

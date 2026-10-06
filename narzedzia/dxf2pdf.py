@@ -273,14 +273,33 @@ def okno() -> None:
 
 
 def main() -> None:
+    # exe okienkowy nie ma konsoli: sys.stdout/stderr = None, a biblioteki (PyMuPDF, ezdxf)
+    # potrafia tam pisac komunikaty - bez tego konczyloby sie bledem
+    konsola = sys.stdout is not None
+    if not konsola:
+        sys.stdout = sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
     if len(sys.argv) == 1:
         okno()
         return
-    # tryb wiersza polecen: dxf2pdf <folder_dxf> [<folder_pdf>]
+
+    # tryb wiersza polecen: dxf2pdf <folder_dxf> [<folder_pdf>]; dziennik tez w pliku
     wejscie = pathlib.Path(sys.argv[1])
     wyjscie = pathlib.Path(sys.argv[2]) if len(sys.argv) > 2 else wejscie
-    log = print if sys.stdout else (lambda *_: None)  # exe okienkowy nie ma konsoli
-    _, bledy = konwertuj_folder(wejscie, wyjscie, log=log)
+    wyjscie.mkdir(parents=True, exist_ok=True)
+    with open(wyjscie / "dxf2pdf_log.txt", "w", encoding="utf-8") as plik_logu:
+
+        def log(tekst: str) -> None:
+            plik_logu.write(tekst + "\n")
+            plik_logu.flush()
+            if konsola:
+                print(tekst, flush=True)
+
+        try:
+            _, bledy = konwertuj_folder(wejscie, wyjscie, log=log)
+        except Exception as exc:
+            log(f"BLAD: {exc!r}")
+            bledy = 1
     sys.exit(1 if bledy else 0)
 
 
