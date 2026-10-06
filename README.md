@@ -101,6 +101,19 @@ niebędąca obrazem), jest pomijane przy kolejnych arkuszach. Użyte źródło
 widać w kolumnie **Źródło podkładu**. Gdy nie działa żadne, w arkuszu zostaje
 `orientacja.png` z szablonu. `--serwer-kafli URL` dodaje własny serwer na początek listy.
 
+### Gdy podkład się nie pobiera
+
+1. Sprawdź wersję – na początku program wypisuje `Generator arkuszy v1.2.0`
+   i listę źródeł podkładu. Jeśli tego nie widać, uruchamiasz starą wersję pliku.
+2. Uruchom diagnostykę: `python generuj_arkusze.py --test-zrodel`. Program pobierze po jednym
+   kaflu z każdego źródła i wypisze `[OK]` / `[BŁĄD]` z przyczyną (także dla źródeł nazw i Pillow).
+3. W sieci firmowej z inspekcją SSL spróbuj `--bez-weryfikacji-ssl`.
+
+Źródło jest wyłączane do końca przebiegu tylko przy odmowie serwera (HTTP 403/404…),
+odpowiedzi niebędącej obrazem albo gdy wszystkie kafle są identyczne (kafel „Access blocked”).
+Chwilowy błąd (np. przekroczony czas) daje drugą próbę jeszcze w tym samym arkuszu
+i przy następnym. Błędy przetwarzania obrazu trafiają do `wyniki/bledy_podkladu.log`.
+
 ## Kolumny zestawienia
 
 Lp., oznaczenie stacji, nr, miejscowość, gmina, powiat, województwo, źródło

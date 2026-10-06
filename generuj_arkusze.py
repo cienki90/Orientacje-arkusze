@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 from xml.sax.saxutils import escape
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 
 # ============================================================================
@@ -517,27 +517,38 @@ PLACE_KEYS = ("village", "town", "city", "hamlet", "isolated_dwelling",
 
 
 class OsmError(RuntimeError):
-    pass
+    """Błąd źródła danych. hard=True: serwer odmawia / zwraca złe dane (nie ponawiać)."""
+
+    def __init__(self, msg, hard: bool = False):
+        super().__init__(msg)
+        self.hard = hard
+
+
+SSL_CONTEXT = None          # ustawiane opcją --bez-weryfikacji-ssl
 
 
 def _http_get(url: str, user_agent: str, timeout: int = 30, retries: int = 3) -> bytes:
     import urllib.error
     req = urllib.request.Request(url, headers={"User-Agent": user_agent,
                                                "Accept-Language": "pl"})
-    last = None
+    last, hard = None, False
     for attempt in range(retries):
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with urllib.request.urlopen(req, timeout=timeout, context=SSL_CONTEXT) as r:
                 return r.read()
         except urllib.error.HTTPError as exc:
-            last = exc
-            if exc.code in (400, 401, 403, 404, 410):     # nie ma sensu ponawiać
+            last = f"HTTP {exc.code} {exc.reason}"
+            if exc.code in (400, 401, 403, 404, 410, 418, 451):     # odmowa - nie ma sensu ponawiać
+                hard = True
                 break
         except Exception as exc:          # noqa: BLE001 - ponawiamy każdą awarię sieci
             last = exc
+            if "CERTIFICATE_VERIFY_FAILED" in str(exc):
+                last = f"{exc} (sieć firmowa? spróbuj opcji --bez-weryfikacji-ssl)"
+                break
         if attempt + 1 < retries:
             time.sleep(1.5 * (attempt + 1))
-    raise OsmError(f"Nie udało się pobrać {url}: {last}")
+    raise OsmError(f"{last} [{url}]", hard=hard)
 
 
 # ---------------------------------------------------------------------------
@@ -616,7 +627,7 @@ class PlaceResolver:
             if data is None:
                 return _http_get(url, self.user_agent, timeout=25, retries=2)
             req = urllib.request.Request(url, data=data, headers={"User-Agent": self.user_agent})
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with urllib.request.urlopen(req, timeout=60, context=SSL_CONTEXT) as r:
                 return r.read()
         finally:
             self._last[key] = time.time()
@@ -809,7 +820,7 @@ _IMAGE_MAGIC = (b"\x89PNG", b"\xff\xd8\xff", b"GIF8", b"RIFF", b"II*\x00", b"MM\
 def _check_image(data: bytes, url: str) -> bytes:
     if not data.startswith(_IMAGE_MAGIC):
         snippet = data[:150].decode("utf-8", "replace").replace("\n", " ")
-        raise OsmError(f"serwer zwrócił coś innego niż obraz ({url}): {snippet}")
+        raise OsmError(f"serwer zwrócił coś innego niż obraz ({url}): {snippet}", hard=True)
     return data
 
 
@@ -837,8 +848,10 @@ class BasemapProvider:
         self.user_agent = user_agent
         self.delay = delay
         self.log = log
-        self.dead: dict[str, str] = {}          # klucz źródła -> powód
+        self.dead: dict[str, str] = {}          # klucz źródła -> powód (pomijane do końca)
+        self.soft_fail: dict[str, int] = {}     # chwilowe błędy (timeout itp.) - ile arkuszy z rzędu
         self.downloaded: dict[str, int] = {}
+        self.error_log: Path | None = None
 
     # --- pobieranie z cache ------------------------------------------------------
     def _cached(self, src: BasemapSource, rel: str, url: str) -> bytes:
@@ -879,14 +892,25 @@ class BasemapProvider:
         if n_tiles > 2500:
             raise OsmError(f"za dużo kafli ({n_tiles}) - zmniejsz --zoom")
 
+        import hashlib
         mosaic = Image.new("RGB", ((tx1 - tx0 + 1) * ts, (ty1 - ty0 + 1) * ts), "white")
+        hashes = set()
         for tx in range(tx0, tx1 + 1):
             for ty in range(ty0, ty1 + 1):
-                with Image.open(io.BytesIO(self._tile(src, zoom, tx, ty))) as im:
+                data = self._tile(src, zoom, tx, ty)
+                hashes.add(hashlib.sha1(data).hexdigest())
+                with Image.open(io.BytesIO(data)) as im:
                     im = im.convert("RGB")
                     if im.size != (ts, ts):
                         im = im.resize((ts, ts))
                     mosaic.paste(im, ((tx - tx0) * ts, (ty - ty0) * ts))
+        if n_tiles >= 4 and len(hashes) == 1:
+            # serwer odsyła wszędzie ten sam kafel: "Access blocked" albo pusty obraz
+            for tx in range(tx0, tx1 + 1):
+                for ty in range(ty0, ty1 + 1):
+                    (self.cache_dir / "kafle" / src.key / f"{zoom}/{tx}/{ty}.img").unlink(missing_ok=True)
+            raise OsmError(f"wszystkie {n_tiles} kafli są identyczne - serwer blokuje dostęp "
+                           "albo zwraca puste kafle", hard=True)
         ox, oy = tx0 * ts, ty0 * ts
         cache = {}
 
@@ -952,31 +976,101 @@ class BasemapProvider:
         height = max(1, int(math.ceil((ymax - ymin) / resolution)))
         bbox = (xmin, ymax - height * resolution, xmin + width * resolution, ymax)
         errors = []
+        # 1. przebieg: wszystkie źródła po kolei; 2. przebieg: jeszcze raz te z chwilowym błędem
+        retry = []
         for src in self.sources:
             if src.key in self.dead:
                 continue
+            if errors:
+                self.log(f"    podkład: próbuję źródła '{src.name}'...")
+            img = self._try(src, bbox, zone, width, height, resolution, zoom, errors, retry)
+            if img is not None:
+                return self._save(img, out_png, bbox, width, height, resolution, src)
+        for src in retry:
+            if src.key in self.dead:
+                continue
+            self.log(f"    podkład: ponawiam źródło z chwilowym błędem '{src.name}'...")
+            img = self._try(src, bbox, zone, width, height, resolution, zoom, errors, [])
+            if img is not None:
+                return self._save(img, out_png, bbox, width, height, resolution, src)
+        raise OsmError("żadne źródło podkładu nie zadziałało"
+                       + (": " + " | ".join(errors) if errors else
+                          " (wszystkie zostały wcześniej wyłączone: "
+                          + "; ".join(f"{k}: {v}" for k, v in self.dead.items()) + ")"))
+
+    def _try(self, src, bbox, zone, width, height, resolution, zoom, errors, retry):
+        try:
+            if src.kind == "wms":
+                img, _ = self._render_wms(src, bbox, zone, width, height, resolution)
+            else:
+                img, _ = self._render_xyz(src, bbox, zone, width, height, resolution, zoom)
+        except Exception as exc:  # noqa: BLE001 - każde niepowodzenie = następne źródło
+            errors.append(f"{src.key}: {exc}")
+            self._source_failed(src, exc)
+            if src.key not in self.dead:
+                retry.append(src)
+            return None
+        self.soft_fail.pop(src.key, None)
+        return img
+
+    def _save(self, img, out_png, bbox, width, height, resolution, src):
+        out_png = Path(out_png)
+        out_png.parent.mkdir(parents=True, exist_ok=True)
+        img.save(out_png, optimize=True)
+        out_png.with_suffix(".pgw").write_text(            # środek lewego górnego piksela
+            "\n".join(f"{v:.10f}" for v in (resolution, 0.0, 0.0, -resolution,
+                                             bbox[0] + resolution / 2, bbox[3] - resolution / 2)) + "\n")
+        return {"path": out_png, "width": width, "height": height, "xmin": bbox[0], "ymin": bbox[1],
+                "resolution": resolution, "source": src}
+
+    def _source_failed(self, src, exc):
+        import traceback
+        from_source = isinstance(exc, (OsmError, OSError)) or type(exc).__name__ == "UnidentifiedImageError"
+        if not from_source:
+            # to nie wina serwera, tylko przetwarzania obrazu - zapisz szczegóły
+            if self.error_log is not None:
+                self.error_log.parent.mkdir(parents=True, exist_ok=True)
+                with open(self.error_log, "a", encoding="utf-8") as f:
+                    f.write(f"--- {src.key} ---\n{traceback.format_exc()}\n")
+            self.log(f"UWAGA: błąd przetwarzania podkładu z '{src.name}': {type(exc).__name__}: {exc}"
+                     + (f" (szczegóły: {self.error_log})" if self.error_log else ""))
+            return
+        hard = getattr(exc, "hard", False)
+        n = self.soft_fail.get(src.key, 0) + 1
+        self.soft_fail[src.key] = n
+        if hard or n >= 2:
+            self.dead[src.key] = str(exc)
+            how = "wyłączam do końca" if hard else "drugi raz z rzędu - wyłączam do końca"
+        else:
+            how = "spróbuję go jeszcze przy następnym arkuszu"
+        rest = [s.key for s in self.sources if s.key not in self.dead and s is not src]
+        self.log(f"UWAGA: źródło podkładu '{src.name}' nie działa: {exc} ({how}). "
+                 + (f"Kolejne: {', '.join(rest)}" if rest else "Brak kolejnych źródeł."))
+
+    def test(self, lat: float, lon: float, zone: int, x: float, y: float, zoom: int = 16):
+        """Pobiera po jednym kaflu z każdego źródła (bez cache). Zwraca listę (źródło, ok, opis)."""
+        out = []
+        for src in self.sources:
+            t0 = time.time()
             try:
                 if src.kind == "wms":
-                    img, n = self._render_wms(src, bbox, zone, width, height, resolution)
+                    q = urllib.parse.urlencode({
+                        "SERVICE": "WMS", "VERSION": "1.1.1", "REQUEST": "GetMap", "LAYERS": src.layers,
+                        "STYLES": "", "SRS": f"EPSG:{epsg_for_zone(zone)}",
+                        "BBOX": f"{x - 128:.1f},{y - 128:.1f},{x + 128:.1f},{y + 128:.1f}",
+                        "WIDTH": 256, "HEIGHT": 256, "FORMAT": src.image_format})
+                    url = f"{src.url}?{q}"
                 else:
-                    img, n = self._render_xyz(src, bbox, zone, width, height, resolution, zoom)
-            except Exception as exc:  # noqa: BLE001 - każde niepowodzenie = następne źródło
-                self.dead[src.key] = str(exc)
-                errors.append(f"{src.key}: {exc}")
-                rest = [s.key for s in self.sources if s.key not in self.dead]
-                self.log(f"UWAGA: źródło podkładu '{src.name}' nie działa ({exc}). "
-                         + (f"Próbuję następnego: {rest[0]}" if rest else "Brak kolejnych źródeł."))
-                continue
-            out_png = Path(out_png)
-            out_png.parent.mkdir(parents=True, exist_ok=True)
-            img.save(out_png, optimize=True)
-            out_png.with_suffix(".pgw").write_text(            # środek lewego górnego piksela
-                "\n".join(f"{v:.10f}" for v in (resolution, 0.0, 0.0, -resolution,
-                                                 bbox[0] + resolution / 2, bbox[3] - resolution / 2)) + "\n")
-            return {"path": out_png, "width": width, "height": height, "xmin": bbox[0], "ymin": bbox[1],
-                    "resolution": resolution, "requests": n, "source": src}
-        raise OsmError("żadne źródło podkładu nie zadziałało"
-                       + (": " + " | ".join(errors) if errors else " (wszystkie wcześniej zawiodły)"))
+                    z = min(zoom, src.max_zoom)
+                    px, py = wgs84_to_tile_px(lat, lon, z)
+                    tx, ty = int(px // 256), int(py // 256)
+                    s = src.subdomains[(tx + ty) % len(src.subdomains)] if src.subdomains else ""
+                    url = src.url.format(z=z, x=tx, y=ty, s=s)
+                data = _check_image(_http_get(url, self.user_agent, timeout=20, retries=1), url)
+                out.append((src, True, f"OK, {len(data)} B, {time.time() - t0:.1f} s"))
+            except Exception as exc:  # noqa: BLE001
+                out.append((src, False, str(exc)))
+        return out
 
 
 def resolve_sources(keys, custom_url: str | None = None):
@@ -1298,6 +1392,7 @@ class Generator:
             self.basemap = BasemapProvider(opt.cache_dir,
                                            resolve_sources(opt.basemap_sources, opt.tile_url),
                                            opt.user_agent or DEFAULT_USER_AGENT, log=log)
+            self.basemap.error_log = opt.out_dir / "bledy_podkladu.log"
 
     # --- analiza szablonu ----------------------------------------------------
     def _table_entities(self, doc):
@@ -1481,6 +1576,9 @@ class Generator:
         opt = self.opt
         opt.out_dir.mkdir(parents=True, exist_ok=True)
         todo = [s for s in self.stations if not opt.only or s.nr in opt.only or s.number in opt.only]
+        self.log(f"Generator arkuszy v{__version__}")
+        if self.basemap is not None:
+            self.log("Źródła podkładu (po kolei): " + ", ".join(s.key for s in self.basemap.sources))
         self.log(f"Szablon: {opt.template}  |  układ PL-2000 strefa {self.zone} (EPSG:{epsg_for_zone(self.zone)})")
         self.log(f"Znaleziono stacji: {len(self.stations)}, do wygenerowania: {len(todo)}")
         self.log(f"Tabelka: znacznik '{self.station_placeholder}', miejscowość w szablonie '{self.template_place}'")
@@ -1563,6 +1661,10 @@ def parse_args(argv=None):
                    help="kolejność źródeł podkładu, próbowanych gdy poprzednie zawiedzie "
                         f"(domyślnie: {','.join(DEFAULT_SOURCE_ORDER)})")
     g.add_argument("--lista-zrodel", action="store_true", help="pokaż dostępne źródła podkładu i nazw, i zakończ")
+    g.add_argument("--test-zrodel", action="store_true",
+                   help="sprawdź, które źródła podkładu i nazw odpowiadają z tego komputera, i zakończ")
+    g.add_argument("--bez-weryfikacji-ssl", action="store_true",
+                   help="nie sprawdzaj certyfikatów HTTPS (sieci firmowe z inspekcją SSL)")
     g.add_argument("--zoom", type=int, default=16, help="poziom kafli OSM (domyślnie 16, max 19)")
     g.add_argument("--rozdzielczosc", type=float, default=1.0, help="rozmiar piksela podkładu w m (domyślnie 1.0)")
     g.add_argument("--margines-podkladu", type=float, default=0.15,
@@ -1588,6 +1690,10 @@ def main(argv=None) -> int:
         except AttributeError:
             pass
     a = parse_args(argv)
+    if a.bez_weryfikacji_ssl:
+        import ssl
+        global SSL_CONTEXT
+        SSL_CONTEXT = ssl._create_unverified_context()
     if a.lista_zrodel:
         print("Źródła podkładu (--zrodla-podkladu):")
         for src in BASEMAP_SOURCES.values():
@@ -1615,11 +1721,56 @@ def main(argv=None) -> int:
         place_phrase=a.fraza_miejscowosci, station_placeholder=a.znacznik_stacji,
         file_pattern=a.nazwa_pliku,
     )
+    if a.test_zrodel:
+        return test_sources(opt)
     try:
         Generator(opt).run()
     except (ValueError, OSError) as exc:
         print(f"BŁĄD: {exc}", file=sys.stderr)
         return 1
+    return 0
+
+
+def test_sources(opt) -> int:
+    """Diagnostyka: czy z tego komputera odpowiadają źródła podkładu i nazw."""
+    print(f"Generator arkuszy v{__version__} - test źródeł")
+    try:
+        doc = DxfDocument.load(opt.template)
+        st = find_stations(doc, opt.zone_layer)[0]
+        zone = pl2000_zone_from_easting(st.x)
+        x, y = st.x, st.y
+    except Exception as exc:  # noqa: BLE001
+        print(f"  (nie odczytano stacji z szablonu: {exc} - używam punktu testowego)")
+        zone, (x, y) = 7, wgs84_to_pl2000(52.2215, 21.368, 7)
+    lat, lon = pl2000_to_wgs84(x, y, zone)
+    print(f"Punkt testowy: {lat:.5f} N, {lon:.5f} E\n\nPodkład mapowy:")
+    prov = BasemapProvider(opt.cache_dir, resolve_sources(opt.basemap_sources, opt.tile_url),
+                           opt.user_agent or DEFAULT_USER_AGENT, log=lambda *a: None)
+    ok_any = False
+    for src, ok, msg in prov.test(lat, lon, zone, x, y, opt.zoom):
+        ok_any |= ok
+        print(f"  [{'OK ' if ok else 'BŁĄD'}] {src.key:<15} {msg}")
+    print("\nNazwy miejscowości:")
+    for key in opt.place_sources:
+        key = key.strip().lower()
+        r = PlaceResolver(Path(opt.cache_dir) / "_test", [key], opt.user_agent or DEFAULT_USER_AGENT,
+                          verify=False, log=lambda *a: None)
+        r.cache = {}
+        r._save = lambda: None
+        try:
+            res = r._query(key, lat, lon, x, y, zone)
+            print(f"  [OK ] {key:<15} {res.get('miejscowosc') or '(brak nazwy w odpowiedzi)'}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [BŁĄD] {key:<15} {exc}")
+    try:
+        import PIL
+        print(f"\nPillow: {PIL.__version__}")
+    except ImportError:
+        print("\nPillow: BRAK - zainstaluj: pip install pillow")
+        ok_any = False
+    if not ok_any:
+        print("\nŻadne źródło podkładu nie działa. Najczęstsze przyczyny: brak internetu, zapora/proxy"
+              " firmowe, inspekcja SSL (spróbuj --bez-weryfikacji-ssl).")
     return 0
 
 
