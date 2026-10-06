@@ -1,9 +1,11 @@
-"""Wariant bez CAD-a: kazdy plik DXF w folderze -> jeden PDF obok niego.
+"""Wariant bez CAD-a: kazdy plik DXF w folderze -> jeden PDF.
 
 Kazdy arkusz (paperspace, w kolejnosci zakladek) = jedna strona PDF.
-Uzycie:  py dxf2pdf.py "C:\\sciezka\\do\\folderu"
+Uzycie:  py dxf2pdf.py                      - okno z wyborem folderow
+         py dxf2pdf.py <folder_dxf> [<folder_pdf>]   - bez okna (domyslnie PDF obok DXF)
 Wymaga:  pip install ezdxf pymupdf
 """
+import os
 import pathlib
 import re
 import sys
@@ -117,7 +119,7 @@ def zaokraglij_wektory(pdf) -> None:
             pdf.update_stream(xref, _LICZBA.sub(krotsza, tresc))
 
 
-def dxf_do_pdf(dxf: pathlib.Path) -> int:
+def dxf_do_pdf(dxf: pathlib.Path, pdf: pathlib.Path) -> int:
     doc, _ = recover.readfile(dxf)
 
     # obrazy (np. "..\\orientacja.png") szukamy po nazwie w folderze DXF i folderze wyzej
@@ -145,17 +147,141 @@ def dxf_do_pdf(dxf: pathlib.Path) -> int:
     zaokraglij_wektory(wynik)
 
     ile = wynik.page_count
-    wynik.save(dxf.with_suffix(".pdf"), garbage=3, deflate=True, deflate_images=True, deflate_fonts=True)
+    wynik.save(pdf, garbage=3, deflate=True, deflate_images=True, deflate_fonts=True)
     return ile
 
 
-def main() -> None:
-    folder = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".")
-    for dxf in sorted(folder.glob("*.dxf")):
+def konwertuj_folder(wejscie: pathlib.Path, wyjscie: pathlib.Path, log=print) -> tuple[int, int]:
+    """Kazdy DXF z folderu `wejscie` -> PDF w folderze `wyjscie`. Zwraca (udane, bledy)."""
+    pliki = sorted(wejscie.glob("*.dxf"))
+    if not pliki:
+        log(f"Brak plikow DXF w: {wejscie}")
+        return 0, 0
+    wyjscie.mkdir(parents=True, exist_ok=True)
+    ok = bledy = 0
+    for i, dxf in enumerate(pliki, 1):
+        pdf = wyjscie / (dxf.stem + ".pdf")
         try:
-            print(f"OK   {dxf.with_suffix('.pdf').name}  ({dxf_do_pdf(dxf)} ark.)")
+            ark = dxf_do_pdf(dxf, pdf)
+            log(f"[{i}/{len(pliki)}] OK   {pdf.name}  ({ark} ark., {pdf.stat().st_size / 1e6:.1f} MB)")
+            ok += 1
         except Exception as exc:  # jeden zly plik nie zatrzymuje reszty
-            print(f"BLAD {dxf.name}: {exc}")
+            log(f"[{i}/{len(pliki)}] BLAD {dxf.name}: {exc}")
+            bledy += 1
+    log(f"Gotowe: {ok} PDF, bledy: {bledy}")
+    return ok, bledy
+
+
+# ---------------------------------------------------------------- okno
+
+USTAWIENIA = pathlib.Path(os.environ.get("APPDATA") or pathlib.Path.home()) / "dxf2pdf.json"
+
+
+def okno() -> None:
+    import json
+    import queue
+    import threading
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, scrolledtext
+
+    try:
+        zapisane = json.loads(USTAWIENIA.read_text(encoding="utf-8"))
+    except Exception:
+        zapisane = {}
+
+    root = tk.Tk()
+    root.title("DXF -> PDF")
+    root.minsize(640, 400)
+    var_wej = tk.StringVar(value=zapisane.get("wejscie", ""))
+    var_wyj = tk.StringVar(value=zapisane.get("wyjscie", ""))
+    kolejka: queue.Queue = queue.Queue()
+
+    def wybierz(var: tk.StringVar, tytul: str) -> None:
+        folder = filedialog.askdirectory(title=tytul, initialdir=var.get() or var_wej.get() or None)
+        if folder:
+            var.set(str(pathlib.Path(folder)))
+            if var is var_wej and not var_wyj.get():
+                var_wyj.set(var.get())
+
+    ramka = tk.Frame(root, padx=10, pady=10)
+    ramka.pack(fill="both", expand=True)
+    ramka.columnconfigure(1, weight=1)
+    for wiersz, (opis, var, tytul) in enumerate(
+        [
+            ("Folder z plikami DXF:", var_wej, "Wybierz folder z plikami DXF"),
+            ("Folder na pliki PDF:", var_wyj, "Wybierz folder na pliki PDF"),
+        ]
+    ):
+        tk.Label(ramka, text=opis).grid(row=wiersz, column=0, sticky="w", pady=3)
+        tk.Entry(ramka, textvariable=var).grid(row=wiersz, column=1, sticky="ew", padx=5)
+        tk.Button(ramka, text="Wybierz...", command=lambda v=var, t=tytul: wybierz(v, t)).grid(row=wiersz, column=2)
+
+    przyciski = tk.Frame(ramka)
+    przyciski.grid(row=2, column=0, columnspan=3, sticky="w", pady=8)
+    btn_start = tk.Button(przyciski, text="Konwertuj", width=14)
+    btn_start.pack(side="left")
+    btn_otworz = tk.Button(przyciski, text="Otworz folder PDF", state="disabled",
+                           command=lambda: os.startfile(var_wyj.get()))
+    btn_otworz.pack(side="left", padx=8)
+
+    dziennik = scrolledtext.ScrolledText(ramka, height=15, state="disabled")
+    dziennik.grid(row=3, column=0, columnspan=3, sticky="nsew")
+    ramka.rowconfigure(3, weight=1)
+
+    def dopisz(tekst: str) -> None:
+        dziennik.configure(state="normal")
+        dziennik.insert("end", tekst + "\n")
+        dziennik.see("end")
+        dziennik.configure(state="disabled")
+
+    def odbieraj() -> None:
+        while not kolejka.empty():
+            wpis = kolejka.get()
+            if wpis is None:  # koniec pracy
+                btn_start.configure(state="normal")
+                btn_otworz.configure(state="normal")
+            else:
+                dopisz(wpis)
+        root.after(100, odbieraj)
+
+    def start() -> None:
+        wej = pathlib.Path(var_wej.get().strip())
+        wyj = pathlib.Path(var_wyj.get().strip() or var_wej.get().strip())
+        if not var_wej.get().strip() or not wej.is_dir():
+            messagebox.showerror("DXF -> PDF", "Wybierz istniejacy folder z plikami DXF.")
+            return
+        var_wyj.set(str(wyj))
+        try:
+            USTAWIENIA.write_text(json.dumps({"wejscie": str(wej), "wyjscie": str(wyj)}), encoding="utf-8")
+        except OSError:
+            pass
+        btn_start.configure(state="disabled")
+        dopisz(f"--- {wej}  ->  {wyj}")
+
+        def praca() -> None:
+            try:
+                konwertuj_folder(wej, wyj, log=kolejka.put)
+            except Exception as exc:
+                kolejka.put(f"BLAD: {exc}")
+            kolejka.put(None)
+
+        threading.Thread(target=praca, daemon=True).start()
+
+    btn_start.configure(command=start)
+    root.after(100, odbieraj)
+    root.mainloop()
+
+
+def main() -> None:
+    if len(sys.argv) == 1:
+        okno()
+        return
+    # tryb wiersza polecen: dxf2pdf <folder_dxf> [<folder_pdf>]
+    wejscie = pathlib.Path(sys.argv[1])
+    wyjscie = pathlib.Path(sys.argv[2]) if len(sys.argv) > 2 else wejscie
+    log = print if sys.stdout else (lambda *_: None)  # exe okienkowy nie ma konsoli
+    _, bledy = konwertuj_folder(wejscie, wyjscie, log=log)
+    sys.exit(1 if bledy else 0)
 
 
 if __name__ == "__main__":
