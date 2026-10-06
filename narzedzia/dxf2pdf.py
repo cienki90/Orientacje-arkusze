@@ -17,6 +17,35 @@ except ImportError:  # starsze wersje PyMuPDF
     import fitz
 
 
+def pomin_niedrukowalne(doc) -> list[str]:
+    """Ukrywa warstwy z wylaczonym drukowaniem (oraz Defpoints) - tak jak CAD przy wydruku.
+
+    Zmiana dotyczy tylko pamieci, plik DXF nie jest zapisywany.
+    """
+    niedrukowalne = {
+        layer.dxf.name.lower()
+        for layer in doc.layers
+        if layer.dxf.get("plot", 1) == 0 or layer.dxf.name.lower() == "defpoints"
+    }
+    if not niedrukowalne:
+        return []
+
+    # CAD drukuje zawartosc rzutni nawet, gdy sama rzutnia lezy na warstwie
+    # niedrukowalnej - wtedy znika tylko jej ramka. Przenosimy takie rzutnie
+    # na warstwe 0, zeby po wylaczeniu warstwy nie zniknela ich zawartosc.
+    for psp in doc.layouts:
+        if psp.name == "Model":
+            continue
+        for vp in psp.query("VIEWPORT"):
+            if vp.dxf.layer.lower() in niedrukowalne:
+                vp.dxf.layer = "0"
+
+    for layer in doc.layers:
+        if layer.dxf.name.lower() in niedrukowalne:
+            layer.off()
+    return sorted(niedrukowalne)
+
+
 def dxf_do_pdf(dxf: pathlib.Path) -> int:
     doc, _ = recover.readfile(dxf)
 
@@ -27,6 +56,8 @@ def dxf_do_pdf(dxf: pathlib.Path) -> int:
             if kandydat.exists():
                 imgdef.dxf.filename = str(kandydat)
                 break
+
+    pomin_niedrukowalne(doc)
 
     cfg = config.Configuration(image_policy=config.ImagePolicy.DISPLAY)
     wynik = fitz.open()

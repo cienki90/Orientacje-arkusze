@@ -24,6 +24,7 @@ GstarCAD otworzy każdy plik, wydrukuje arkusze do `_strony\` i zamknie go. Na k
 py -m pip install ezdxf pymupdf
 py dxf2pdf.py "C:\sciezka\do\folderu\z\dxf"
 ```
+Warstwy z wyłączonym drukowaniem oraz `Defpoints` nie trafiają do PDF-a, tak samo jak przy wydruku z CAD-a.
 Ten wariant jest szybszy, ale odwzorowanie może być trochę słabsze niż w CAD-zie, np. fonty SHX i grubości linii z CTB.
 
 ## Uwaga: `orientacja.png`
