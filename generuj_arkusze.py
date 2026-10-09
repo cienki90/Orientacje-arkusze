@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Generuje osobne plany orientacyjne DXF dla każdej stacji trafo z szablonu.
+"""Generator Rysunków Stałych - osobne plany orientacyjne DXF dla każdej stacji trafo z szablonu.
+
+Uruchomiony bez parametrów pyta (okienkiem) o plik szablonu i folder na wyniki.
 
 Przykłady:
-    python generuj_arkusze.py                       # szablon.dxf -> wyniki/
+    python generuj_arkusze.py                       # zapyta o szablon i folder wyników
+    python generuj_arkusze.py szablon.dxf --wyniki D:\\wyniki   # bez pytania
     python generuj_arkusze.py --stacje 541,664      # tylko wybrane stacje
     python generuj_arkusze.py --bez-podkladu        # bez pobierania mapy OSM
     python generuj_arkusze.py --nazwy nazwy.csv     # ręczne nazwy miejscowości
@@ -26,7 +29,8 @@ from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 from xml.sax.saxutils import escape
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
+APP_NAME = "Generator Rysunków Stałych"
 
 
 # ============================================================================
@@ -1753,7 +1757,7 @@ class Generator:
         opt = self.opt
         opt.out_dir.mkdir(parents=True, exist_ok=True)
         todo = [s for s in self.stations if not opt.only or s.nr in opt.only or s.number in opt.only]
-        self.log(f"Generator arkuszy v{__version__}")
+        self.log(f"{APP_NAME} v{__version__}")
         if self.basemap is not None:
             self.log("Źródła podkładu (po kolei): " + ", ".join(s.key for s in self.basemap.sources))
         self.log(f"Szablon: {opt.template}  |  układ PL-2000 strefa {self.zone} (EPSG:{epsg_for_zone(self.zone)})")
@@ -1854,8 +1858,10 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("plik", nargs="?", type=Path,
                    help="szablon DXF (można przeciągnąć plik .dxf na ikonę programu); domyślnie szablon.dxf obok programu")
-    p.add_argument("--szablon", type=Path, help="plik szablonu DXF (domyślnie szablon.dxf obok programu)")
-    p.add_argument("--wyniki", type=Path, default=here / "wyniki", help="katalog wynikowy")
+    p.add_argument("--szablon", type=Path, help="plik szablonu DXF (gdy nie podano - program zapyta)")
+    p.add_argument("--wyniki", type=Path, help="folder na wyniki (gdy nie podano - program zapyta)")
+    p.add_argument("--bez-pytania", action="store_true",
+                   help="nie pytaj o pliki: szablon.dxf obok programu, wyniki w folderze 'wyniki' obok szablonu")
     p.add_argument("--excel", type=Path, help="plik zestawienia (domyślnie <wyniki>/zestawienie_stacji.xlsx)")
     p.add_argument("--cache", type=Path, default=default_cache_dir(here),
                    help="katalog cache (kafle, geokodowanie); domyślnie poza OneDrive: %%LOCALAPPDATA%%\\Orientacje-arkusze")
@@ -1918,11 +1924,31 @@ def main(argv=None) -> int:
             stream.reconfigure(errors="replace")
         except AttributeError:
             pass
+    _set_console_title(f"{APP_NAME} v{__version__}")
     a = parse_args(argv)
     here = program_dir()
-    a.szablon = a.szablon or a.plik or here / "szablon.dxf"
-    if a.plik and a.wyniki == here / "wyniki":
-        a.wyniki = Path(a.plik).resolve().parent / "wyniki"      # wyniki obok przeciągniętego szablonu
+    a.szablon = a.szablon or a.plik
+    ask = not (a.bez_pytania or a.lista_zrodel or a.test_zrodel)
+    if ask and not _can_ask():
+        ask = False            # brak okienek i konsoli (np. harmonogram zadań) - wartości domyślne
+    if ask and (a.szablon is None or a.wyniki is None):
+        print(f"{APP_NAME} v{__version__}\n")
+        settings = _load_settings(a.cache)
+        if a.szablon is None:
+            a.szablon = ask_template(settings.get("szablon"), here)
+            if a.szablon is None:
+                print("Nie wybrano pliku szablonu - koniec.")
+                return 1
+            print(f"Szablon: {a.szablon}")
+        if a.wyniki is None:
+            a.wyniki = ask_output_dir(settings.get("wyniki"), Path(a.szablon).resolve().parent)
+            if a.wyniki is None:
+                print("Nie wybrano folderu na wyniki - koniec.")
+                return 1
+            print(f"Wyniki:  {a.wyniki}\n")
+        _save_settings(a.cache, {"szablon": str(Path(a.szablon).resolve()), "wyniki": str(Path(a.wyniki).resolve())})
+    a.szablon = a.szablon or here / "szablon.dxf"
+    a.wyniki = a.wyniki or Path(a.szablon).resolve().parent / "wyniki"
     if a.bez_weryfikacji_ssl:
         import ssl
         global SSL_CONTEXT
@@ -1962,10 +1988,124 @@ def main(argv=None) -> int:
             raise ValueError(f"Nie ma pliku szablonu: {opt.template}\n"
                              "Połóż szablon.dxf obok programu albo przeciągnij plik .dxf na ikonę programu.")
         Generator(opt).run()
+        if ask and os.name == "nt":
+            try:
+                os.startfile(str(opt.out_dir))          # pokaż folder z wynikami w Eksploratorze
+            except OSError:
+                pass
     except (ValueError, OSError) as exc:
         print(f"BŁĄD: {exc}", file=sys.stderr)
         return 1
     return 0
+
+
+# ---------------------------------------------------------------------------
+# pytanie o pliki (okienka Windows, a gdy niedostępne - konsola)
+# ---------------------------------------------------------------------------
+def _set_console_title(title: str):
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetConsoleTitleW(title)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _load_settings(cache_dir) -> dict:
+    try:
+        return json.loads((Path(cache_dir) / "ustawienia.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_settings(cache_dir, data: dict):
+    try:
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
+        (Path(cache_dir) / "ustawienia.json").write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                                                          encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _can_ask() -> bool:
+    try:
+        if sys.stdin is not None and sys.stdin.isatty():
+            return True
+    except (AttributeError, ValueError):
+        pass
+    root = _tk_root()
+    if root is None:
+        return False
+    root.destroy()
+    return True
+
+
+def _input(prompt: str) -> str:
+    try:
+        return input(prompt)
+    except EOFError:
+        return ""
+
+
+def _tk_root():
+    """Ukryte okno tkinter na wierzchu (żeby okienko wyboru nie schowało się za konsolą)."""
+    try:
+        import tkinter
+        root = tkinter.Tk()
+    except Exception:  # noqa: BLE001 - brak tkinter / brak ekranu
+        return None
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except Exception:  # noqa: BLE001
+        pass
+    return root
+
+
+def _initial_dir(last: str | None, fallback: Path) -> str:
+    if last:
+        p = Path(last)
+        for cand in (p, p.parent):
+            if cand.is_dir():
+                return str(cand)
+    return str(fallback)
+
+
+def ask_template(last: str | None, here: Path) -> Path | None:
+    print("Wybierz plik szablonu DXF...")
+    root = _tk_root()
+    if root is not None:
+        from tkinter import filedialog
+        name = filedialog.askopenfilename(
+            parent=root, title=f"{APP_NAME} - wybierz plik szablonu DXF",
+            initialdir=_initial_dir(last, here),
+            filetypes=[("Rysunek DXF", "*.dxf"), ("Wszystkie pliki", "*.*")])
+        root.destroy()
+        return Path(name) if name else None
+    while True:                                    # bez okienek - pytanie w konsoli
+        default = last if last and Path(last).is_file() else str(here / "szablon.dxf")
+        ans = _input(f"Ścieżka do szablonu DXF [{default}]: ").strip().strip('"')
+        path = Path(ans or default)
+        if path.is_file():
+            return path
+        if not ans and not Path(default).is_file():
+            return None
+        print(f"  Nie ma pliku: {path}")
+
+
+def ask_output_dir(last: str | None, template_dir: Path) -> Path | None:
+    print("Wybierz folder, w którym zapisać wyniki...")
+    root = _tk_root()
+    if root is not None:
+        from tkinter import filedialog
+        name = filedialog.askdirectory(
+            parent=root, title=f"{APP_NAME} - wybierz folder na wyniki",
+            initialdir=_initial_dir(last, template_dir), mustexist=False)
+        root.destroy()
+        return Path(name) if name else None
+    default = last or str(template_dir / "wyniki")
+    ans = _input(f"Folder na wyniki [{default}]: ").strip().strip('"')
+    return Path(ans or default)
 
 
 def _pause_if_double_clicked():
@@ -1982,7 +2122,7 @@ def _pause_if_double_clicked():
 
 def test_sources(opt) -> int:
     """Diagnostyka: czy z tego komputera odpowiadają źródła podkładu i nazw."""
-    print(f"Generator arkuszy v{__version__} - test źródeł")
+    print(f"{APP_NAME} v{__version__} - test źródeł")
     try:
         doc = DxfDocument.load(opt.template)
         st = find_stations(doc, opt.zone_layer)[0]

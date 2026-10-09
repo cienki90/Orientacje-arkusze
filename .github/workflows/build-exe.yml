@@ -1,4 +1,4 @@
-name: Buduj exe (Windows)
+name: Buduj Generator Rysunków Stałych (exe)
 
 on:
   push:
@@ -28,19 +28,19 @@ jobs:
       - name: Instalacja
         run: python -m pip install --upgrade pip pyinstaller pillow
 
-      - name: Budowanie GeneratorArkuszy.exe
+      - name: Budowanie GeneratorRysunkowStalych.exe
         run: >
-          pyinstaller --onefile --console --name GeneratorArkuszy
+          pyinstaller --onefile --console --name GeneratorRysunkowStalych --hidden-import tkinter --hidden-import tkinter.filedialog
           --hidden-import PIL.Image --hidden-import PIL.JpegImagePlugin --hidden-import PIL.PngImagePlugin
           generuj_arkusze.py
 
       - name: Test 1 - lista źródeł
-        run: dist\GeneratorArkuszy.exe --lista-zrodel
+        run: dist\GeneratorRysunkowStalych.exe --lista-zrodel
 
       - name: Test 2 - wszystkie stacje bez sieci
         shell: pwsh
         run: |
-          dist\GeneratorArkuszy.exe szablon.dxf --wyniki test_offline --bez-podkladu --bez-geokodowania --nazwy nazwy_przyklad.csv
+          dist\GeneratorRysunkowStalych.exe szablon.dxf --wyniki test_offline --bez-podkladu --bez-geokodowania --nazwy nazwy_przyklad.csv
           if ($LASTEXITCODE -ne 0) { exit 1 }
           $n = (Get-ChildItem test_offline -Filter *.dxf).Count
           Write-Host "Plików DXF: $n"
@@ -50,7 +50,7 @@ jobs:
       - name: Test 3 - prawdziwy podkład i nazwy z internetu
         shell: pwsh
         run: |
-          dist\GeneratorArkuszy.exe szablon.dxf --wyniki test_online --stacje 541,664 --cache test_cache
+          dist\GeneratorRysunkowStalych.exe szablon.dxf --wyniki test_online --stacje 541,664 --cache test_cache
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Get-ChildItem test_online | Format-Table Name, Length
           foreach ($nr in 541, 664) {
@@ -63,7 +63,7 @@ jobs:
         shell: pwsh
         run: |
           python -c "import generuj_arkusze as g; d=g.DxfDocument.load('szablon.dxf'); [d.tags.__setitem__(i, None) for h in ('986B','986C') for i in range(d.by_handle[h].start, d.by_handle[h].end)]; open('szablon_bez_obrazu.dxf','wb').write(d.to_bytes())"
-          dist\GeneratorArkuszy.exe szablon_bez_obrazu.dxf --wyniki test_bez_obrazu --stacje 541 --cache test_cache
+          dist\GeneratorRysunkowStalych.exe szablon_bez_obrazu.dxf --wyniki test_bez_obrazu --stacje 541 --cache test_cache
           if ($LASTEXITCODE -ne 0) { exit 1 }
           if (-not (Test-Path test_bez_obrazu\541_podklad.jpg)) { exit 1 }
 
@@ -72,12 +72,12 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force paczka | Out-Null
-          if (Test-Path dist\GeneratorArkuszy.exe) { Copy-Item dist\GeneratorArkuszy.exe paczka\ }
+          if (Test-Path dist\GeneratorRysunkowStalych.exe) { Copy-Item dist\GeneratorRysunkowStalych.exe paczka\ }
           Copy-Item README.md, nazwy_przyklad.csv paczka\
 
       - uses: actions/upload-artifact@v4
         with:
-          name: GeneratorArkuszy
+          name: GeneratorRysunkowStalych
           path: paczka/
 
       - uses: actions/upload-artifact@v4
@@ -92,8 +92,8 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/GeneratorArkuszy.exe
+          files: dist/GeneratorRysunkowStalych.exe
           body: |
-            GeneratorArkuszy.exe - generator planów orientacyjnych stacji trafo.
-            Połóż exe obok szablon.dxf i uruchom dwuklikiem (albo przeciągnij plik .dxf na ikonę).
-            Wyniki: folder "wyniki" obok szablonu.
+            Generator Rysunków Stałych - plany orientacyjne stacji trafo z szablonu DXF.
+            Uruchom GeneratorRysunkowStalych.exe dwuklikiem: program zapyta o plik szablonu
+            i folder, w którym zapisać wyniki.

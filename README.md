@@ -1,4 +1,4 @@
-# Orientacje – generator planów orientacyjnych stacji trafo
+# Generator Rysunków Stałych
 
 Program bierze `szablon.dxf` (wszystkie stacje na jednym rysunku) i dla każdej
 stacji trafo tworzy osobny plik DXF – tak jak ręcznie przygotowane `541.dxf`,
@@ -26,12 +26,15 @@ tabelka, układy, obiekty proxy) zostaje bez zmian.
 
 ## Wersja exe (bez instalowania Pythona)
 
-Pobierz `GeneratorArkuszy.exe` z zakładki **Releases**
-(https://github.com/cienki90/Orientacje-arkusze/releases/latest), połóż obok `szablon.dxf`
-i uruchom dwuklikiem. Możesz też przeciągnąć dowolny plik `.dxf` na ikonę programu –
-wyniki trafią do folderu `wyniki` obok tego pliku. Wszystkie opcje opisane niżej działają
-tak samo, np. `GeneratorArkuszy.exe --test-zrodel`. Exe jest budowany automatycznie
-(GitHub Actions) i przed publikacją testowany na prawdziwych serwerach OSM.
+Pobierz `GeneratorRysunkowStalych.exe` z zakładki **Releases**
+(https://github.com/cienki90/Orientacje-arkusze/releases/latest) i uruchom dwuklikiem.
+Program zapyta okienkiem o **plik szablonu DXF** i o **folder, w którym zapisać wyniki**
+(zapamiętuje ostatni wybór), a po zakończeniu otworzy folder z wynikami.
+
+Można też przeciągnąć plik `.dxf` na ikonę programu – wtedy pyta tylko o folder wyników.
+Bez pytania: `GeneratorRysunkowStalych.exe szablon.dxf --wyniki D:\wyniki`
+albo `--bez-pytania` (szablon.dxf obok programu, wyniki w folderze `wyniki` obok szablonu).
+Pozostałe opcje działają tak samo, np. `--test-zrodel`.
 
 ## Instalacja
 
@@ -49,9 +52,9 @@ pip install -r requirements.txt
 python generuj_arkusze.py
 ```
 
-Pod Windows można też dwukrotnie kliknąć `generuj.bat`.
+Program zapyta o plik szablonu i folder na wyniki. Pod Windows można też dwukrotnie kliknąć `generuj.bat`.
 
-Wyniki trafiają do katalogu `wyniki/`:
+Wyniki trafiają do wybranego folderu:
 
 ```
 wyniki/
@@ -117,7 +120,7 @@ rastrowego, program sam dodaje obraz podkładu pod rysunkiem (na warstwie `!podk
 
 ### Gdy podkład się nie pobiera
 
-1. Sprawdź wersję – na początku program wypisuje `Generator arkuszy v1.3.1`
+1. Sprawdź wersję – na początku program wypisuje `Generator Rysunków Stałych v1.5.0`
    i listę źródeł podkładu. Jeśli tego nie widać, uruchamiasz starą wersję pliku.
 2. Uruchom diagnostykę: `python generuj_arkusze.py --test-zrodel`. Program pobierze po jednym
    kaflu z każdego źródła i wypisze `[OK]` / `[BŁĄD]` z przyczyną (także dla źródeł nazw i Pillow).
